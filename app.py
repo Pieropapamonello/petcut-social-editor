@@ -138,15 +138,21 @@ def render_video():
             file.save(path)
             paths.append(path)
         command = ["ffmpeg", "-y"]
-        for path in paths:
+        if len(paths) == 1:
+            path = paths[0]
             command.extend((["-loop", "1", "-framerate", "30", "-i", str(path)] if path.suffix[1:] in ALLOWED_IMAGE else ["-stream_loop", "-1", "-i", str(path)]))
-        command.extend(["-i", str(audio_path)])
-        labels, filters = [], []
-        for index in range(scenes):
-            label, input_index = f"s{index}", index % len(paths)
-            filters.append(f"[{input_index}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,trim=duration={scene_duration:.3f},setpts=PTS-STARTPTS[{label}]")
-            labels.append(f"[{label}]")
-        filter_complex = ";".join(filters) + ";" + "".join(labels) + f"concat=n={scenes}:v=1:a=0[m];[m]{visual_filter(style, bpm, title)}[outv]"
+            command.extend(["-i", str(audio_path)])
+            filter_complex = f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,{visual_filter(style, bpm, title)}[outv]"
+        else:
+            for path in paths:
+                command.extend((["-loop", "1", "-framerate", "30", "-i", str(path)] if path.suffix[1:] in ALLOWED_IMAGE else ["-stream_loop", "-1", "-i", str(path)]))
+            command.extend(["-i", str(audio_path)])
+            labels, filters = [], []
+            for index in range(scenes):
+                label, input_index = f"s{index}", index % len(paths)
+                filters.append(f"[{input_index}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,trim=duration={scene_duration:.3f},setpts=PTS-STARTPTS[{label}]")
+                labels.append(f"[{label}]")
+            filter_complex = ";".join(filters) + ";" + "".join(labels) + f"concat=n={scenes}:v=1:a=0[m];[m]{visual_filter(style, bpm, title)}[outv]"
         destination = OUTPUT_DIR / f"petcut-{uuid.uuid4().hex}.mp4"
         command.extend(["-t", f"{duration:.2f}", "-filter_complex", filter_complex, "-map", "[outv]", "-map", f"{len(paths)}:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(destination)])
         try:
