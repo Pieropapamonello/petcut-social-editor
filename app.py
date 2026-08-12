@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import uuid
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -24,6 +25,8 @@ OUTPUT_HEIGHT = 1280
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+JOBS = {}
+RENDER_QUEUE = ThreadPoolExecutor(max_workers=1)
 
 
 def extension_allowed(filename, allowed):
@@ -114,31 +117,10 @@ def analyze_audio():
     ))
 
 
-@app.post("/api/render")
-def render_video():
-    media = [file for file in request.files.getlist("media") if file and file.filename]
-    audio = request.files.get("audio")
-    style, title = request.form.get("style", "cinematic"), request.form.get("title", "").strip()
-    requested_seconds = min(60, max(5, int(request.form.get("duration", "15"))))
-    if not media or not audio:
-        abort(400, "Carica almeno una foto o un video e una canzone.")
-    if style not in {"cinematic", "beat", "collage"}:
-        abort(400, "Preset non valido.")
-    if any(not extension_allowed(file.filename, ALLOWED_VIDEO | ALLOWED_IMAGE) for file in media) or not extension_allowed(audio.filename, ALLOWED_AUDIO):
-        abort(400, "Formato non supportato. Usa foto JPG/PNG/WebP, video MP4/MOV/WebM e audio MP3/WAV/M4A/AAC/OGG.")
-    with tempfile.TemporaryDirectory(prefix="petcut-") as temp:
-        temp_dir = Path(temp)
-        audio_path = temp_dir / f"audio.{secure_filename(audio.filename).rsplit('.', 1)[1]}"
-        audio.save(audio_path)
+def render_job(job_id, paths, audio_path, style, title, requested_seconds, job_dir):
+    try:
         duration, bpm = min(float(requested_seconds), media_duration(audio_path)), estimate_bpm(audio_path)
-        scenes, scene_duration = recommended_scenes(duration, bpm, style), 0
-        scene_duration = duration / scenes
-        paths = []
-        for index, file in enumerate(media):
-            extension = secure_filename(file.filename).rsplit(".", 1)[1].lower()
-            path = temp_dir / f"media-{index}.{extension}"
-            file.save(path)
-            paths.append(path)
+        scenes, scene_duration = recommended_scenes(duration, bpm, style), duration / recommended_scenes(duration, bpm, style)
         command = ["ffmpeg", "-y"]
         if len(paths) == 1:
             path = paths[0]
@@ -155,16 +137,52 @@ def render_video():
                 filters.append(f"[{input_index}:v]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1,fps=30,trim=duration={scene_duration:.3f},setpts=PTS-STARTPTS[{label}]")
                 labels.append(f"[{label}]")
             filter_complex = ";".join(filters) + ";" + "".join(labels) + f"concat=n={scenes}:v=1:a=0[m];[m]{visual_filter(style, bpm, title)}[outv]"
-        destination = OUTPUT_DIR / f"petcut-{uuid.uuid4().hex}.mp4"
+        destination = job_dir / "petcut-social-edit.mp4"
         command.extend(["-t", f"{duration:.2f}", "-filter_complex", filter_complex, "-map", "[outv]", "-map", f"{len(paths)}:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(destination)])
-        try:
-            run(command)
-        except subprocess.CalledProcessError as error:
-            app.logger.error(error.stderr)
-            abort(500, "Non sono riuscito a generare il video. Prova un file diverso.")
-    response = send_file(destination, as_attachment=True, download_name="petcut-social-edit.mp4", mimetype="video/mp4")
-    response.headers["X-Detected-BPM"], response.headers["X-Recommended-Content"] = str(bpm), str(scenes)
-    return response
+        run(command)
+        JOBS[job_id].update(status="complete", output=str(destination), bpm=bpm, scenes=scenes)
+    except Exception as error:
+        app.logger.exception("Render failed")
+        JOBS[job_id].update(status="failed", error="Generazione non riuscita. Prova un video più breve o riprova tra poco.")
+
+
+@app.post("/api/render")
+def render_video():
+    media, audio = [file for file in request.files.getlist("media") if file and file.filename], request.files.get("audio")
+    style, title = request.form.get("style", "cinematic"), request.form.get("title", "").strip()
+    requested_seconds = min(60, max(5, int(request.form.get("duration", "15"))))
+    if not media or not audio:
+        abort(400, "Carica almeno una foto o un video e una canzone.")
+    if style not in {"cinematic", "beat", "collage"} or any(not extension_allowed(file.filename, ALLOWED_VIDEO | ALLOWED_IMAGE) for file in media) or not extension_allowed(audio.filename, ALLOWED_AUDIO):
+        abort(400, "Formato o preset non supportato.")
+    job_id, job_dir = uuid.uuid4().hex, OUTPUT_DIR / "jobs" / uuid.uuid4().hex
+    job_dir.mkdir(parents=True, exist_ok=True)
+    audio_path = job_dir / f"audio.{secure_filename(audio.filename).rsplit('.', 1)[1]}"
+    audio.save(audio_path)
+    paths = []
+    for index, file in enumerate(media):
+        path = job_dir / f"media-{index}.{secure_filename(file.filename).rsplit('.', 1)[1].lower()}"
+        file.save(path)
+        paths.append(path)
+    JOBS[job_id] = {"status": "processing"}
+    RENDER_QUEUE.submit(render_job, job_id, paths, audio_path, style, title, requested_seconds, job_dir)
+    return jsonify(job_id=job_id), 202
+
+
+@app.get("/api/render/<job_id>")
+def render_status(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        abort(404, "Job non trovato. Riprova a generare il video.")
+    return jsonify({key: value for key, value in job.items() if key != "output"})
+
+
+@app.get("/api/render/<job_id>/download")
+def download_render(job_id):
+    job = JOBS.get(job_id)
+    if not job or job.get("status") != "complete":
+        abort(404, "Il video non è ancora pronto.")
+    return send_file(job["output"], as_attachment=True, download_name="petcut-social-edit.mp4", mimetype="video/mp4")
 
 
 @app.errorhandler(413)

@@ -25,12 +25,23 @@ form.elements.duration.addEventListener('change', analyzeSong);
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault(); button.disabled = true;
-  status.textContent = 'Analizzo il beat e genero il tuo edit: potrebbe volerci qualche minuto…';
+  status.textContent = 'Preparazione dell’edit…';
   try {
     const response = await fetch('/api/render', { method: 'POST', body: new FormData(form) });
     if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || 'Generazione non riuscita.');
-    const blob = await response.blob(); const link = document.createElement('a');
+    const { job_id: jobId } = await response.json();
+    let job;
+    do {
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+      const progress = await fetch(`/api/render/${jobId}`);
+      job = await progress.json();
+      status.textContent = job.status === 'complete' ? 'Video pronto: avvio il download…' : 'Montaggio in corso: puoi lasciare aperta questa pagina.';
+    } while (job.status === 'processing');
+    if (job.status !== 'complete') throw new Error(job.error || 'Generazione non riuscita.');
+    const download = await fetch(`/api/render/${jobId}/download`);
+    if (!download.ok) throw new Error('Il download non è disponibile. Riprova.');
+    const blob = await download.blob(); const link = document.createElement('a');
     link.href = URL.createObjectURL(blob); link.download = 'petcut-social-edit.mp4'; link.click(); URL.revokeObjectURL(link.href);
-    status.textContent = `Pronto! BPM: ${response.headers.get('X-Detected-BPM') || '—'}; scene ritmiche create: ${response.headers.get('X-Recommended-Content') || '—'}. Il download è iniziato.`;
+    status.textContent = `Pronto! BPM: ${job.bpm || '—'}; scene ritmiche create: ${job.scenes || '—'}. Il download è iniziato.`;
   } catch (error) { status.textContent = error.message; } finally { button.disabled = false; }
 });
