@@ -1,10 +1,17 @@
 # PetCut Social Editor
 
-Web app Flask che trasforma una o più foto/video e una canzone in un MP4 verticale 9:16 (720×1280) con zoom ritmico, color grading e testo opzionale. Include tre preset: Cinematic Zoom, Fast Beat Edit e CapCut Collage.
+Web app Flask che trasforma una o più foto/video e una canzone in un MP4 verticale 9:16 (720×1280), pronto per Reels e TikTok.
 
-Quando si seleziona una canzone, l'app stima il BPM e suggerisce il numero ideale di foto/clip per la durata e il preset scelti. Anche un solo contenuto è sufficiente: PetCut lo ripete in scene con movimento e variazioni sincronizzate al ritmo.
+L'app analizza sia il BPM musicale sia gli attacchi del brano. Se la canzone è lenta, usa un tempo di montaggio più rapido e aggancia tagli, flash e cambi d'inquadratura agli onset rilevati. L'interfaccia suggerisce quanti contenuti distinti usare, ma funziona anche con una sola foto o un solo video.
 
-Il preset **Floating Cutout** estrae automaticamente fotogrammi dal materiale caricato, isola il soggetto, li monta su uno sfondo nero con testo e chiude con un reveal del video originale. Per ritagli più puliti, scegli filmati in cui il soggetto è ben illuminato, separato dallo sfondo e vicino al centro dell'inquadratura.
+Preset disponibili:
+
+- **Cinematic Zoom**
+- **Fast Beat Edit**
+- **CapCut Collage**
+- **Floating Cutout**, ispirato agli edit social con soggetti scontornati su nero
+
+Floating Cutout usa una timeline in quattro atti: mini-intro, roulette di sagome, collage di parole e climax a tutto schermo. Un rilevatore leggero identifica persone e animali; GrabCut e l'analisi temporale ripuliscono lo sfondo. Il primo render Floating può richiedere qualche secondo in più perché scarica il modello compatto del rilevatore.
 
 ## Avvio locale
 
@@ -21,4 +28,4 @@ Apri `http://localhost:10000`.
 
 Il file `render.yaml` è un Blueprint. Su Render scegli **New > Blueprint**, collega questo repository e conferma il servizio Docker. Render userà FFmpeg incluso nel Dockerfile.
 
-Nota: i file caricati e generati sono temporanei. Per produzione e file grandi è consigliato collegare uno storage persistente (es. Cloudinary o S3/R2).
+I file caricati, i fotogrammi intermedi e i microclip sono temporanei. Al termine del montaggio PetCut conserva soltanto l'MP4 finale del job.

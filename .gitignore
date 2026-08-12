@@ -2,4 +2,5 @@ __pycache__/
 *.py[cod]
 .env
 data/exports/
+data/models/
 .DS_Store

@@ -53,6 +53,7 @@ form.addEventListener('submit', async (event) => {
     if (!download.ok) throw new Error('Il download non è disponibile. Riprova.');
     const blob = await download.blob(); const link = document.createElement('a');
     link.href = URL.createObjectURL(blob); link.download = 'petcut-social-edit.mp4'; link.click(); URL.revokeObjectURL(link.href);
-    status.textContent = `Pronto! BPM: ${job.bpm || '—'}; scene ritmiche create: ${job.scenes || '—'}. Il download è iniziato.`;
+    const rhythm = job.edit_bpm && job.edit_bpm !== job.bpm ? `${job.bpm} BPM (tagli a ${job.edit_bpm})` : `${job.bpm || '—'} BPM`;
+    status.textContent = `Pronto! Ritmo: ${rhythm}; cambi ritmici creati: ${job.scenes || '—'}. Il download è iniziato.`;
   } catch (error) { status.textContent = error.message; } finally { button.disabled = false; }
 });
