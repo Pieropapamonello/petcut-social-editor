@@ -8,4 +8,4 @@ COPY . .
 RUN mkdir -p /app/data/exports
 ENV PYTHONUNBUFFERED=1 PORT=10000 U2NET_HOME=/opt/rembg
 EXPOSE 10000
-CMD ["gunicorn", "--bind", "0.0.0.0:10000", "--workers", "1", "--timeout", "180", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:10000", "--worker-class", "gthread", "--workers", "1", "--threads", "2", "--timeout", "180", "app:app"]
