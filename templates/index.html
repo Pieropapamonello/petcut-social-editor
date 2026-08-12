@@ -1,6 +1,230 @@
 <!doctype html>
-<html lang="it"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>PetCut — Social video editor</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"></head>
-<body><main class="shell"><p class="eyebrow">PETCUT STUDIO</p><h1>Trasforma un momento<br>in un social edit.</h1><p class="intro">Carica una o più foto/video e una canzone: PetCut crea un video verticale ritmato, pronto per Reels e TikTok.</p>
-<form id="editor-form"><label>Foto o video <span>(uno o più file)</span><input type="file" name="media" accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/webm" multiple required></label><label>Canzone <input type="file" name="audio" accept="audio/mpeg,audio/wav,audio/mp4,audio/aac,audio/ogg" required></label>
-<div class="grid"><label>Stile<select name="style"><option value="cinematic">Cinematic Zoom</option><option value="beat">Fast Beat Edit</option><option value="collage">CapCut Collage</option><option value="floating">Floating Cutout</option></select></label><label>Durata<select name="duration"><option value="10">10 secondi</option><option value="15" selected>15 secondi</option><option value="30">30 secondi</option><option value="60">60 secondi</option></select></label></div>
-<p id="song-analysis" class="analysis">Carica una canzone: analizzerò il ritmo e il numero ideale di contenuti.</p><label>Testo iniziale <span>(facoltativo)</span><input name="title" maxlength="32" placeholder="es. IL MIO CANE"></label><button type="submit">Genera il mio edit</button><p id="status" aria-live="polite">Limite di caricamento: {{ max_upload_mb }} MB per richiesta.</p></form></main><script src="{{ url_for('static', filename='app.js') }}"></script></body></html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Crea un video verticale sincronizzato con la musica usando foto e clip.">
+  <title>PetCut Studio</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header class="site-header">
+    <a class="brand" href="/" aria-label="PetCut Studio, pagina iniziale">
+      <span class="brand-mark" aria-hidden="true">P</span>
+      <span>PetCut Studio</span>
+    </a>
+    <span class="format-badge">9:16 · Social</span>
+  </header>
+
+  <main class="page-shell">
+    <section class="hero" aria-labelledby="page-title">
+      <p class="eyebrow">VIDEO EDITOR AUTOMATICO</p>
+      <h1 id="page-title">Il tuo momento,<br><span>a tempo di musica.</span></h1>
+      <p>Carica foto o video, scegli una canzone e un preset. PetCut analizza il ritmo e prepara un montaggio verticale pronto per Reels e TikTok.</p>
+    </section>
+
+    <form id="editor-form" class="editor-card" enctype="multipart/form-data">
+      <section class="form-section" aria-labelledby="media-heading">
+        <div class="section-heading">
+          <span class="step-number" aria-hidden="true">1</span>
+          <div>
+            <h2 id="media-heading">Scegli i contenuti</h2>
+            <p>Una o più foto e clip. Puoi iniziare anche con un solo file.</p>
+          </div>
+        </div>
+
+        <label class="file-picker" for="media-input">
+          <span class="file-icon" aria-hidden="true">＋</span>
+          <span class="file-picker-copy">
+            <strong>Aggiungi foto o video</strong>
+            <small>JPG, PNG, WebP, MP4, MOV o WebM</small>
+          </span>
+          <span class="file-action" aria-hidden="true">Sfoglia</span>
+        </label>
+        <input class="visually-hidden" id="media-input" type="file" name="media"
+          accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/webm"
+          multiple required aria-describedby="media-summary upload-limit">
+        <div id="media-summary" class="file-summary" aria-live="polite">Nessun contenuto selezionato.</div>
+      </section>
+
+      <section class="form-section" aria-labelledby="audio-heading">
+        <div class="section-heading">
+          <span class="step-number" aria-hidden="true">2</span>
+          <div>
+            <h2 id="audio-heading">Aggiungi la canzone</h2>
+            <p>Il ritmo guiderà tagli, movimenti e transizioni.</p>
+          </div>
+        </div>
+
+        <label class="file-picker compact" for="audio-input">
+          <span class="audio-icon" aria-hidden="true">♫</span>
+          <span class="file-picker-copy">
+            <strong>Scegli la traccia audio</strong>
+            <small>MP3, WAV, M4A, AAC o OGG</small>
+          </span>
+          <span class="file-action" aria-hidden="true">Sfoglia</span>
+        </label>
+        <input class="visually-hidden" id="audio-input" type="file" name="audio"
+          accept="audio/mpeg,audio/wav,audio/mp4,audio/aac,audio/ogg"
+          required aria-describedby="audio-summary song-analysis">
+        <div id="audio-summary" class="file-summary" aria-live="polite">Nessuna canzone selezionata.</div>
+
+        <div id="song-analysis" class="analysis-panel" aria-live="polite" aria-busy="false">
+          <div class="analysis-empty">
+            <span class="pulse-dot" aria-hidden="true"></span>
+            Carica una canzone per vedere BPM, ritmo di montaggio e numero consigliato di contenuti.
+          </div>
+          <div class="analysis-result" hidden>
+            <div class="metric">
+              <span>BPM musica</span>
+              <strong id="music-bpm">—</strong>
+            </div>
+            <div class="metric">
+              <span>BPM montaggio</span>
+              <strong id="edit-bpm">—</strong>
+            </div>
+            <div class="metric">
+              <span>Contenuti ideali</span>
+              <strong id="content-count">—</strong>
+            </div>
+            <div class="metric">
+              <span>Cambi visivi</span>
+              <strong id="visual-cuts">—</strong>
+            </div>
+          </div>
+          <p id="analysis-note" class="analysis-note" hidden></p>
+        </div>
+      </section>
+
+      <section class="form-section" aria-labelledby="preset-heading">
+        <div class="section-heading">
+          <span class="step-number" aria-hidden="true">3</span>
+          <div>
+            <h2 id="preset-heading">Scegli lo stile</h2>
+            <p>Ogni preset usa una regia e una sequenza di effetti diversa.</p>
+          </div>
+        </div>
+
+        <fieldset class="preset-fieldset">
+          <legend class="visually-hidden">Preset di montaggio</legend>
+          <div class="preset-grid">
+            <label class="preset-card">
+              <input type="radio" name="style" value="animal_roulette" checked>
+              <span class="preset-check" aria-hidden="true"></span>
+              <span class="preset-visual roulette" aria-hidden="true"><i></i><i></i><i></i></span>
+              <strong>Animal Roulette</strong>
+              <small>Etichette, cutout, collage di parole e climax veloce.</small>
+            </label>
+
+            <label class="preset-card">
+              <input type="radio" name="style" value="mystery_reveal">
+              <span class="preset-check" aria-hidden="true"></span>
+              <span class="preset-visual mystery" aria-hidden="true">???</span>
+              <strong>Mystery Reveal</strong>
+              <small>Silhouette, indizi luminosi e rivelazione sul drop.</small>
+            </label>
+
+            <label class="preset-card">
+              <input type="radio" name="style" value="kinetic_strips">
+              <span class="preset-check" aria-hidden="true"></span>
+              <span class="preset-visual strips" aria-hidden="true"><i></i><i></i><i></i></span>
+              <strong>Kinetic Strips</strong>
+              <small>Pannelli obliqui, testo condensato e slice dinamiche.</small>
+            </label>
+
+            <label class="preset-card">
+              <input type="radio" name="style" value="beat_montage">
+              <span class="preset-check" aria-hidden="true"></span>
+              <span class="preset-visual beat" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+              <strong>Beat Montage</strong>
+              <small>Tagli rapidi, zoom, flash e cambi in sincro con il beat.</small>
+            </label>
+          </div>
+        </fieldset>
+
+        <div class="preset-phases" aria-live="polite">
+          <span>Fasi del preset</span>
+          <ol id="preset-phase-list"></ol>
+        </div>
+      </section>
+
+      <section class="form-section" aria-labelledby="details-heading">
+        <div class="section-heading">
+          <span class="step-number" aria-hidden="true">4</span>
+          <div>
+            <h2 id="details-heading">Ultimi dettagli</h2>
+            <p>Scegli la durata e aggiungi un titolo, se vuoi.</p>
+          </div>
+        </div>
+
+        <div class="details-grid">
+          <label for="duration-select">
+            <span>Durata</span>
+            <select id="duration-select" name="duration">
+              <option value="10">10 secondi</option>
+              <option value="15" selected>15 secondi</option>
+              <option value="24">24 secondi</option>
+              <option value="30">30 secondi</option>
+            </select>
+          </label>
+
+          <label for="title-input">
+            <span>Titolo <small>(facoltativo)</small></span>
+            <input id="title-input" name="title" maxlength="32" autocomplete="off" placeholder="Es. IL MIO CANE">
+          </label>
+        </div>
+      </section>
+
+      <p id="upload-limit" class="upload-limit">Limite totale di caricamento: {{ max_upload_mb }} MB.</p>
+      <button id="submit-button" class="primary-button" type="submit">
+        <span>Genera il mio video</span>
+        <span aria-hidden="true">→</span>
+      </button>
+      <p id="form-error" class="form-error" role="alert" hidden></p>
+    </form>
+
+    <section id="render-panel" class="render-panel" aria-labelledby="render-heading" hidden>
+      <div class="render-topline">
+        <div>
+          <p class="eyebrow">MONTAGGIO IN CORSO</p>
+          <h2 id="render-heading" tabindex="-1">Stiamo creando il tuo edit</h2>
+        </div>
+        <strong id="progress-percent" aria-hidden="true">0%</strong>
+      </div>
+      <progress id="render-progress" max="100" value="0">0%</progress>
+      <p id="render-status" class="render-status" aria-live="polite">Preparazione dei file…</p>
+      <ol class="render-steps" aria-label="Fasi della generazione">
+        <li data-render-step="0"><span></span>Analisi del ritmo</li>
+        <li data-render-step="1"><span></span>Preparazione dei soggetti</li>
+        <li data-render-step="2"><span></span>Montaggio e transizioni</li>
+        <li data-render-step="3"><span></span>Esportazione del video</li>
+      </ol>
+      <p class="keep-open">Puoi continuare a usare questa scheda, ma non chiuderla fino alla fine.</p>
+    </section>
+
+    <section id="result-panel" class="result-panel" aria-labelledby="result-heading" hidden>
+      <div class="result-copy">
+        <p class="eyebrow">VIDEO PRONTO</p>
+        <h2 id="result-heading" tabindex="-1">Il tuo edit è finito.</h2>
+        <p id="result-summary">Guarda l'anteprima oppure scarica il file MP4.</p>
+      </div>
+      <div class="video-frame">
+        <video id="result-video" controls playsinline preload="metadata">
+          Il browser non supporta la riproduzione video.
+        </video>
+      </div>
+      <div class="result-actions">
+        <a id="download-button" class="primary-button" href="#" download="petcut-social-edit.mp4">Scarica il video</a>
+        <button id="new-edit-button" class="secondary-button" type="button">Crea un altro edit</button>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <span>PetCut Studio</span>
+    <span>Output verticale · MP4 · 30 fps</span>
+  </footer>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

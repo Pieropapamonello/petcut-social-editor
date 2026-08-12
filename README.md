@@ -1,31 +1,55 @@
-# PetCut Social Editor
+# PetCut Studio
 
-Web app Flask che trasforma una o più foto/video e una canzone in un MP4 verticale 9:16 (576×1024), pronto per Reels e TikTok.
+PetCut trasforma foto o video e una canzone in un montaggio verticale 9:16, esportato in MP4 a 576×1024 e 30 fps per Reels e TikTok.
 
-L'app analizza sia il BPM musicale sia gli attacchi del brano. Se la canzone è lenta, usa un tempo di montaggio più rapido e aggancia tagli, flash e cambi d'inquadratura agli onset rilevati. L'interfaccia suggerisce quanti contenuti distinti usare, ma funziona anche con una sola foto o un solo video.
+Il motore non applica un effetto casuale in modo uniforme: analizza BPM, transienti, intensità e punto di drop, poi costruisce una timeline diversa per ogni sezione del brano. I tagli sono quantizzati sui frame e agganciati agli onset più vicini. Anche un solo contenuto può essere riutilizzato con inquadrature, pose, crop e movimenti differenti.
 
-Preset disponibili:
+## Preset
 
-- **Cinematic Zoom**
-- **Fast Beat Edit**
-- **CapCut Collage**
-- **Floating Cutout**, ispirato agli edit social con soggetti scontornati su nero
+- **Animal Roulette** — quattro atti: etichette, roulette di cutout, frase cinetica e climax full-frame.
+- **Mystery Reveal** — silhouette frammentata, `? / ?? / ???`, rivelazione al drop e montaggio finale.
+- **Kinetic Strips** — titolo condensato dietro al soggetto, pannelli diagonali, card, maschere V/X e strisce.
+- **Beat Montage** — montaggio più semplice con clip leggibili, punch/whip brevi e cambi ogni due beat.
 
-Floating Cutout usa una timeline in quattro atti: mini-intro, roulette di sagome, collage di parole e climax a tutto schermo. Un rilevatore leggero identifica persone e animali; GrabCut e l'analisi temporale ripuliscono lo sfondo. Il primo render Floating può richiedere qualche secondo in più perché scarica il modello compatto del rilevatore.
+Per i preset con livelli, il soggetto viene individuato localmente con un modello ONNX incluso nel repository. Non vengono inviati file a servizi AI esterni. Le informazioni sul modello sono in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Avvio locale
 
-Serve Docker, oppure Python 3.12 e FFmpeg installati.
+Il modo più semplice è Docker:
 
 ```bash
-docker build -t petcut .
-docker run -p 10000:10000 petcut
+docker build -t petcut-studio .
+docker run --rm -p 10000:10000 petcut-studio
 ```
 
 Apri `http://localhost:10000`.
 
+In alternativa servono Python 3.12 e FFmpeg:
+
+```bash
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt
+python app.py
+```
+
+## Test
+
+```bash
+python -m unittest discover -s tests -v
+python -m py_compile app.py audio_analysis.py render_engine.py
+node --check static/app.js
+```
+
 ## Deploy su Render
 
-Il file `render.yaml` è un Blueprint. Su Render scegli **New > Blueprint**, collega questo repository e conferma il servizio Docker. Render userà FFmpeg incluso nel Dockerfile.
+`render.yaml` è il Blueprint del progetto. In Render scegli **New → Blueprint**, collega il repository e conferma il servizio. Il Dockerfile installa FFmpeg, i font e tutte le dipendenze Python.
 
-I file caricati, i fotogrammi intermedi e i microclip sono temporanei. Al termine del montaggio PetCut conserva soltanto l'MP4 finale del job.
+L’endpoint `GET /api/health` permette a Render di verificare lo stato del servizio. I file sorgente e i microclip sono temporanei; al termine del job rimangono soltanto l’MP4 da scaricare e pochi byte di metadati per recuperarne lo stato.
+
+Variabili disponibili:
+
+- `MAX_UPLOAD_MB` — limite totale della richiesta, predefinito a 200 MB.
+- `OUTPUT_DIR` — directory dei render, predefinita a `data/exports`.
+- `PETCUT_MODEL_DIR` — directory del modello di segmentazione, predefinita a `data/models`.

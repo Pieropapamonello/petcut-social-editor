@@ -1,0 +1,16 @@
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+.env
+.venv/
+data/exports/
+data/models/*
+!data/models/yolov8n-seg.onnx
+tests/
+*.mp4
+*.mov
+*.m4v
+*.webm
+*.mp3
+*.wav

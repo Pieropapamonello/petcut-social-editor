@@ -2,6 +2,8 @@ import math
 import os
 import re
 import gc
+import hashlib
+import json
 import shutil
 import subprocess
 import tempfile
@@ -15,9 +17,15 @@ from pathlib import Path
 
 import numpy as np
 import cv2
+import onnxruntime as ort
 from flask import Flask, abort, jsonify, render_template, request, send_file
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from werkzeug.exceptions import HTTPException
 from werkzeug.utils import secure_filename
+
+from audio_analysis import analyze_audio as analyze_audio_structure
+from audio_analysis import recommendation as audio_recommendation
+from render_engine import render_preset
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", BASE_DIR / "data" / "exports"))
@@ -25,6 +33,8 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_VIDEO = {"mp4", "mov", "m4v", "webm"}
 ALLOWED_IMAGE = {"jpg", "jpeg", "png", "webp"}
 ALLOWED_AUDIO = {"mp3", "wav", "m4a", "aac", "ogg"}
+SUPPORTED_STYLES = {"animal_roulette", "mystery_reveal", "kinetic_strips", "beat_montage"}
+CUTOUT_STYLES = {"animal_roulette", "mystery_reveal", "kinetic_strips"}
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
 # The visual reference itself is 576x1024. Matching it also keeps peak memory
 # safely below Render Free's limit while retaining a crisp 9:16 social export.
@@ -38,16 +48,38 @@ RENDER_QUEUE = ThreadPoolExecutor(max_workers=1)
 SUBJECT_NET = None
 SUBJECT_NET_FAILED = False
 SUBJECT_NET_LOCK = threading.Lock()
+FOREGROUND_NET = None
+FOREGROUND_NET_FAILED = False
+FOREGROUND_NET_LOCK = threading.Lock()
+INSTANCE_NET = None
+INSTANCE_NET_FAILED = False
+INSTANCE_NET_LOCK = threading.Lock()
 MODEL_DIR = Path(os.environ.get("PETCUT_MODEL_DIR", BASE_DIR / "data" / "models"))
+INSTANCE_MODEL_SHA256 = "c00375e81c9b2793d12f6473c6fd477ba5cce20710c2c5f1ae2118f4af345112"
 YOLO_CFG = MODEL_DIR / "yolov4-tiny.cfg"
 YOLO_WEIGHTS = MODEL_DIR / "yolov4-tiny.weights"
 YOLO_CFG_URL = "https://raw.githubusercontent.com/AlexeyAB/darknet/master/cfg/yolov4-tiny.cfg"
 YOLO_WEIGHTS_URL = "https://github.com/AlexeyAB/darknet/releases/download/yolov4/yolov4-tiny.weights"
 SUBJECT_CLASSES = {0, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23}
+U2NETP_MODEL = MODEL_DIR / "u2netp.onnx"
+U2NETP_URL = "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx"
+U2NETP_MD5 = "8e83ca70e441ab06c318d82300c84806"
+INSTANCE_MODEL = MODEL_DIR / "yolov8n-seg.onnx"
+# COCO foreground categories useful for people and social animal edits.
+INSTANCE_CLASSES = {0, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23}
 
 
 def extension_allowed(filename, allowed):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in allowed
+
+
+def requested_duration() -> int:
+    """Read a bounded duration without turning malformed form data into a 500."""
+    try:
+        value = int(request.form.get("duration", "15"))
+    except (TypeError, ValueError):
+        abort(400, "Durata non valida.")
+    return min(60, max(5, value))
 
 
 def run(command):
@@ -191,6 +223,187 @@ def source_frame(path: Path, frame_number: int, frame_count: int) -> Image.Image
     return frame
 
 
+def download_checked_model(path: Path, url: str, expected_md5: str, minimum_size: int):
+    """Download a small inference model atomically and verify its contents."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        digest = hashlib.md5(path.read_bytes()).hexdigest()
+        if path.stat().st_size >= minimum_size and digest == expected_md5:
+            return
+        path.unlink(missing_ok=True)
+    temporary = path.with_suffix(path.suffix + ".part")
+    temporary.unlink(missing_ok=True)
+    with urllib.request.urlopen(url, timeout=90) as response, temporary.open("wb") as output:
+        shutil.copyfileobj(response, output)
+    digest = hashlib.md5(temporary.read_bytes()).hexdigest()
+    if temporary.stat().st_size < minimum_size or digest != expected_md5:
+        temporary.unlink(missing_ok=True)
+        raise RuntimeError("Modello di segmentazione incompleto")
+    temporary.replace(path)
+
+
+def foreground_detector():
+    """Load the lightweight U2NetP saliency network through OpenCV DNN."""
+    global FOREGROUND_NET, FOREGROUND_NET_FAILED
+    if FOREGROUND_NET is not None:
+        return FOREGROUND_NET
+    if FOREGROUND_NET_FAILED:
+        return None
+    with FOREGROUND_NET_LOCK:
+        if FOREGROUND_NET is not None:
+            return FOREGROUND_NET
+        if FOREGROUND_NET_FAILED:
+            return None
+        try:
+            download_checked_model(U2NETP_MODEL, U2NETP_URL, U2NETP_MD5, 4_000_000)
+            FOREGROUND_NET = cv2.dnn.readNetFromONNX(str(U2NETP_MODEL))
+        except Exception:
+            FOREGROUND_NET_FAILED = True
+            app.logger.exception("Foreground model unavailable; using GrabCut fallback")
+    return FOREGROUND_NET
+
+
+def neural_saliency(rgb: np.ndarray) -> np.ndarray | None:
+    """Return a soft foreground probability map at the source resolution."""
+    network = foreground_detector()
+    if network is None:
+        return None
+    try:
+        resized = cv2.resize(rgb, (320, 320), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+        resized = (resized - np.array((0.485, 0.456, 0.406), np.float32)) / np.array((0.229, 0.224, 0.225), np.float32)
+        blob = np.transpose(resized, (2, 0, 1))[None]
+        with FOREGROUND_NET_LOCK:
+            network.setInput(blob)
+            output = network.forward(network.getUnconnectedOutLayersNames())[0][0, 0]
+        low, high = float(np.min(output)), float(np.max(output))
+        if high - low < 1e-6:
+            return None
+        output = np.clip((output - low) / (high - low), 0, 1)
+        return cv2.resize(output, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+    except Exception:
+        app.logger.exception("Foreground inference failed; using GrabCut fallback")
+        return None
+
+
+def instance_segmenter():
+    """Load the compact animal/person instance segmenter with bounded threads."""
+    global INSTANCE_NET, INSTANCE_NET_FAILED
+    if INSTANCE_NET is not None:
+        return INSTANCE_NET
+    if INSTANCE_NET_FAILED or not INSTANCE_MODEL.exists():
+        return None
+    with INSTANCE_NET_LOCK:
+        if INSTANCE_NET is not None:
+            return INSTANCE_NET
+        if INSTANCE_NET_FAILED:
+            return None
+        try:
+            digest_path = INSTANCE_MODEL.with_suffix(".sha256-ok")
+            if not digest_path.exists():
+                digest = hashlib.sha256(INSTANCE_MODEL.read_bytes()).hexdigest()
+                if digest != INSTANCE_MODEL_SHA256:
+                    raise RuntimeError("Modello ONNX di segmentazione non valido")
+                try:
+                    digest_path.write_text(digest, encoding="ascii")
+                except OSError:
+                    pass
+            options = ort.SessionOptions()
+            options.intra_op_num_threads = 1
+            options.inter_op_num_threads = 1
+            options.enable_cpu_mem_arena = False
+            INSTANCE_NET = ort.InferenceSession(
+                str(INSTANCE_MODEL),
+                sess_options=options,
+                providers=["CPUExecutionProvider"],
+            )
+        except Exception:
+            INSTANCE_NET_FAILED = True
+            app.logger.exception("Instance segmenter unavailable; using saliency fallback")
+    return INSTANCE_NET
+
+
+def instance_subject_mask(rgb: np.ndarray) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None]:
+    """Return a union mask for relevant COCO people/animals and its tight box."""
+    session = instance_segmenter()
+    if session is None:
+        return None, None
+    try:
+        height, width = rgb.shape[:2]
+        size = 640
+        scale = min(size / width, size / height)
+        scaled_width, scaled_height = round(width * scale), round(height * scale)
+        resized = cv2.resize(rgb, (scaled_width, scaled_height), interpolation=cv2.INTER_AREA)
+        offset_x, offset_y = (size - scaled_width) // 2, (size - scaled_height) // 2
+        canvas = np.full((size, size, 3), 114, np.uint8)
+        canvas[offset_y : offset_y + scaled_height, offset_x : offset_x + scaled_width] = resized
+        tensor = np.transpose(canvas.astype(np.float32) / 255.0, (2, 0, 1))[None]
+        with INSTANCE_NET_LOCK:
+            outputs = session.run(None, {session.get_inputs()[0].name: tensor})
+        detection = next(value for value in outputs if value.ndim == 3 and value.shape[1] > 80)
+        prototype = next(value for value in outputs if value.ndim == 4 and value.shape[1] == 32)[0]
+        predictions = detection[0].T
+        class_scores = predictions[:, 4:84]
+        class_ids = np.argmax(class_scores, axis=1)
+        confidences = np.max(class_scores, axis=1)
+        candidates = np.flatnonzero((confidences >= 0.12) & np.isin(class_ids, list(INSTANCE_CLASSES)))
+        if not len(candidates):
+            return None, None
+
+        boxes = []
+        for candidate in candidates:
+            center_x, center_y, box_width, box_height = predictions[candidate, :4]
+            boxes.append([float(center_x - box_width / 2), float(center_y - box_height / 2), float(box_width), float(box_height)])
+        selected = cv2.dnn.NMSBoxes(boxes, confidences[candidates].tolist(), 0.12, 0.55)
+        if len(selected) == 0:
+            return None, None
+
+        masks = []
+        proto_height, proto_width = prototype.shape[1:]
+        xx = np.arange(proto_width)[None, :]
+        yy = np.arange(proto_height)[:, None]
+        best_confidence = float(np.max(confidences[candidates[np.asarray(selected).reshape(-1)]]))
+        for selected_index in np.asarray(selected).reshape(-1)[:5]:
+            candidate = candidates[int(selected_index)]
+            if float(confidences[candidate]) < max(0.12, best_confidence * 0.38):
+                continue
+            coefficients = predictions[candidate, 84:]
+            logits = np.clip(coefficients @ prototype.reshape(32, -1), -30, 30)
+            mask = (1.0 / (1.0 + np.exp(-logits))).reshape(proto_height, proto_width)
+            box_x, box_y, box_width, box_height = boxes[int(selected_index)]
+            inside = (
+                (xx >= box_x * proto_width / size)
+                & (xx < (box_x + box_width) * proto_width / size)
+                & (yy >= box_y * proto_height / size)
+                & (yy < (box_y + box_height) * proto_height / size)
+            )
+            mask *= inside
+            mask = cv2.resize(mask, (size, size), interpolation=cv2.INTER_LINEAR)
+            mask = mask[offset_y : offset_y + scaled_height, offset_x : offset_x + scaled_width]
+            masks.append(cv2.resize(mask, (width, height), interpolation=cv2.INTER_LANCZOS4))
+        if not masks:
+            return None, None
+
+        probability = np.max(masks, axis=0)
+        binary = (probability > 0.28).astype(np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+        component_count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+        if component_count > 1:
+            keep = np.zeros_like(binary)
+            for component in range(1, component_count):
+                if stats[component, cv2.CC_STAT_AREA] >= max(80, width * height * 0.002):
+                    keep[labels == component] = 1
+            binary = keep
+        probability *= cv2.GaussianBlur(binary.astype(np.float32), (5, 5), 0)
+        points = cv2.findNonZero((binary * 255).astype(np.uint8))
+        if points is None:
+            return None, None
+        box = cv2.boundingRect(points)
+        return probability.astype(np.float32), box
+    except Exception:
+        app.logger.exception("Instance segmentation failed; using saliency fallback")
+        return None, None
+
+
 def subject_detector():
     global SUBJECT_NET, SUBJECT_NET_FAILED
     if SUBJECT_NET is not None:
@@ -260,78 +473,138 @@ def detect_subject(rgb: np.ndarray) -> tuple[int, int, int, int]:
 
 
 def release_subject_detector():
-    global SUBJECT_NET
+    global SUBJECT_NET, FOREGROUND_NET, INSTANCE_NET
     with SUBJECT_NET_LOCK:
         SUBJECT_NET = None
+    with FOREGROUND_NET_LOCK:
+        FOREGROUND_NET = None
+    with INSTANCE_NET_LOCK:
+        INSTANCE_NET = None
     gc.collect()
 
 
 def isolate_subject(frame: Image.Image, motion: np.ndarray | None = None, stability: np.ndarray | None = None, subject_box: tuple[int, int, int, int] | None = None) -> Image.Image:
-    """Detector and temporal-guided GrabCut with a conservative colour trimap."""
+    """Create a clean alpha matte using saliency, detection and GrabCut together."""
     rgb = np.array(frame.convert("RGB"))
     height, width = rgb.shape[:2]
-    x, y, box_width, box_height = subject_box or detect_subject(rgb)
+    instance_probability, instance_box = instance_subject_mask(rgb)
+    x, y, box_width, box_height = instance_box or subject_box or detect_subject(rgb)
     x, y = max(0, x), max(0, y)
     box_width = max(2, min(width - x, box_width))
     box_height = max(2, min(height - y, box_height))
 
     yy, xx = np.mgrid[:height, :width]
-    center_x, center_y = x + box_width * 0.5, y + box_height * 0.43
-    subject_zone = ((xx - center_x) / max(2, box_width * 0.48)) ** 2 + ((yy - center_y) / max(2, box_height * 0.62)) ** 2 < 1
-    core = ((xx - center_x) / max(2, box_width * 0.19)) ** 2 + ((yy - center_y) / max(2, box_height * 0.29)) ** 2 < 1
-    protected_zone = ((xx - center_x) / max(2, box_width * 0.40)) ** 2 + ((yy - center_y) / max(2, box_height * 0.55)) ** 2 < 1
+    center_x, center_y = x + box_width * 0.5, y + box_height * 0.48
+    expanded_left = max(0, int(x - box_width * 0.08))
+    expanded_top = max(0, int(y - box_height * 0.08))
+    expanded_right = min(width, int(x + box_width * 1.08))
+    expanded_bottom = min(height, int(y + box_height * 1.08))
+    subject_zone = (xx >= expanded_left) & (xx < expanded_right) & (yy >= expanded_top) & (yy < expanded_bottom)
+    core = ((xx - center_x) / max(2, box_width * 0.22)) ** 2 + ((yy - (y + box_height * 0.40)) / max(2, box_height * 0.34)) ** 2 < 1
+    face_zone = ((xx - center_x) / max(2, box_width * 0.23)) ** 2 + ((yy - (y + box_height * 0.30)) / max(2, box_height * 0.23)) ** 2 < 1
+    protected_zone = ((xx - center_x) / max(2, box_width * 0.38)) ** 2 + ((yy - center_y) / max(2, box_height * 0.54)) ** 2 < 1
     border = (xx < width * 0.035) | (xx > width * 0.965) | (yy < height * 0.025) | (yy > height * 0.975)
+    saliency = instance_probability if instance_probability is not None else neural_saliency(rgb)
+
+    if instance_probability is not None:
+        # Instance masks are much cleaner around rugs, furniture and floors
+        # than a generic salient-object ellipse. Preserve a soft 2-pixel edge
+        # while keeping the learned mask itself authoritative.
+        alpha = np.clip((instance_probability - 0.20) / 0.58, 0, 1)
+        alpha = (alpha * 255).astype(np.uint8)
+        lab_instance = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+        instance_lightness, instance_a, instance_b = cv2.split(lab_instance)
+        instance_chroma = np.sqrt((instance_a - 128) ** 2 + (instance_b - 128) ** 2)
+        confident = alpha > 210
+        if np.any(confident) and float(np.median(instance_chroma[confident])) < 16 and float(np.median(instance_lightness[confident])) < 72:
+            coloured_background = (instance_chroma > 19) & (instance_lightness > 28) & ~face_zone
+            alpha[coloured_background] = 0
+        # Preserve fur detail but avoid the light fringe produced by dilating
+        # the learned mask into the original background.
+        alpha = cv2.GaussianBlur(alpha, (3, 3), 0)
+        foreground_pixels = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)[alpha > 127]
+        if foreground_pixels.size and float(np.median(foreground_pixels)) < 85:
+            gamma = 0.52 if float(np.median(foreground_pixels)) < 55 else 0.76
+            enhanced = np.clip(np.power(rgb.astype(np.float32) / 255, gamma) * 244 + 11, 0, 255).astype(np.uint8)
+            rgb = np.where((alpha > 0)[:, :, None], enhanced, rgb)
+        return Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
 
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
     lightness, channel_a, channel_b = cv2.split(lab)
-    core_values = lab[core]
-    dark_core = core & (lightness <= np.percentile(core_values[:, 0], 52))
-    foreground_median = np.median(lab[dark_core], axis=0)
-    foreground_mad = np.median(np.abs(lab[dark_core] - foreground_median), axis=0) + 7
+    seed_zone = core if saliency is None else core & (saliency > 0.52)
+    if np.count_nonzero(seed_zone) < 40:
+        seed_zone = core
+    core_values = lab[seed_zone]
+    core_limit = np.percentile(core_values[:, 0], 68)
+    foreground_seeds = seed_zone & (lightness <= core_limit)
+    if np.count_nonzero(foreground_seeds) < 40:
+        foreground_seeds = seed_zone
+    foreground_median = np.median(lab[foreground_seeds], axis=0)
+    foreground_mad = np.median(np.abs(lab[foreground_seeds] - foreground_median), axis=0) + 7
     foreground_distance = np.sqrt(np.sum(((lab - foreground_median) / foreground_mad) ** 2, axis=2))
 
     mask = np.full((height, width), cv2.GC_PR_BGD, np.uint8)
     mask[border | ~subject_zone] = cv2.GC_BGD
-    candidate = subject_zone & (foreground_distance < 3.4)
+    if saliency is not None:
+        mask[(saliency < 0.03) | ~subject_zone] = cv2.GC_BGD
+        candidate = subject_zone & (saliency > 0.18)
+    else:
+        candidate = subject_zone & (foreground_distance < 3.8)
     if motion is not None:
-        candidate |= subject_zone & (motion > 20)
+        candidate |= subject_zone & protected_zone & (motion > 18)
     mask[candidate] = cv2.GC_PR_FGD
     if stability is not None:
         mask[(stability < 7) & ~protected_zone] = cv2.GC_BGD
     chroma = np.sqrt((channel_a - 128) ** 2 + (channel_b - 128) ** 2)
-    if float(np.median(chroma[dark_core])) < 20:
-        mask[(chroma > 22) & (lightness > 35) & ~core] = cv2.GC_BGD
-    sure_foreground = dark_core & (foreground_distance < 1.9)
+    sure_foreground = foreground_seeds & (foreground_distance < 2.2)
+    if saliency is not None:
+        sure_foreground |= subject_zone & (saliency > 0.84) & (foreground_distance < 2.9)
     if motion is not None:
-        sure_foreground |= core & (motion > 40)
+        sure_foreground |= core & (motion > 38)
     mask[sure_foreground] = cv2.GC_FGD
+
+    # A neutral, very dark subject is common in the reference animal edits.
+    # In that case, bright/chromatic stable areas are almost certainly rugs,
+    # furniture or floor. Apply this only for that conservative case so people
+    # and coloured animals keep their clothes/fur.
+    if float(foreground_median[0]) < 62 and float(np.median(chroma[foreground_seeds])) < 18:
+        coloured_background = (chroma > 16) & (lightness > 28) & ~face_zone
+        lower_light_background = (yy > y + box_height * 0.62) & (lightness > 92) & (chroma < 13)
+        mask[coloured_background | lower_light_background] = cv2.GC_BGD
 
     try:
         background, foreground = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
-        cv2.grabCut(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), mask, None, background, foreground, 3, cv2.GC_INIT_WITH_MASK)
+        cv2.grabCut(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), mask, None, background, foreground, 4, cv2.GC_INIT_WITH_MASK)
         alpha = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
     except cv2.error:
         app.logger.exception("Foreground extraction fallback")
-        alpha = np.where(subject_zone, 255, 0).astype(np.uint8)
+        if saliency is not None:
+            alpha = np.clip((saliency - 0.10) / 0.62, 0, 1)
+            alpha = (alpha * 255).astype(np.uint8)
+        else:
+            alpha = np.where(subject_zone, 255, 0).astype(np.uint8)
 
-    alpha = cv2.morphologyEx(alpha, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+    alpha = cv2.morphologyEx(alpha, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
     component_count, labels, stats, centroids = cv2.connectedComponentsWithStats((alpha > 127).astype(np.uint8), 8)
     if component_count > 1:
-        scores = []
+        keep = np.zeros_like(alpha)
         for component in range(1, component_count):
             left, top, component_width, component_height, area = stats[component]
             component_x, component_y = centroids[component]
             distance = ((component_x - center_x) / width) ** 2 + ((component_y - center_y) / height) ** 2
             overlaps_center = left <= center_x <= left + component_width and top <= center_y <= top + component_height
-            scores.append((area * (2 if overlaps_center else 1) / (1 + 8 * distance), component))
-        alpha = np.where(labels == max(scores)[1], 255, 0).astype(np.uint8)
+            overlaps_subject = np.count_nonzero((labels == component) & protected_zone)
+            if area >= 80 and (overlaps_center or overlaps_subject >= max(20, int(area * 0.02))) and distance < 0.28:
+                keep[labels == component] = 255
+        if np.any(keep):
+            alpha = keep
     alpha = cv2.morphologyEx(alpha, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
     alpha = cv2.GaussianBlur(alpha, (5, 5), 0)
 
     foreground_pixels = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)[alpha > 127]
     if foreground_pixels.size and float(np.median(foreground_pixels)) < 85:
-        gamma = 0.74 if float(np.median(foreground_pixels)) < 55 else 0.86
-        enhanced = np.clip(np.power(rgb.astype(np.float32) / 255, gamma) * 255, 0, 255).astype(np.uint8)
+        gamma = 0.58 if float(np.median(foreground_pixels)) < 55 else 0.82
+        enhanced = np.clip(np.power(rgb.astype(np.float32) / 255, gamma) * 241 + 10, 0, 255).astype(np.uint8)
         rgb = np.where((alpha > 0)[:, :, None], enhanced, rgb)
     return Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
 
@@ -345,13 +618,6 @@ def create_cutouts(paths: list[Path], job_dir: Path, count: int) -> tuple[list[P
         frame.convert("RGB").save(sample, quality=94)
         samples.append(sample)
         records.append((source, frame))
-
-    detections = {}
-    for source in paths:
-        source_frames = [frame for record_source, frame in records if record_source == source]
-        if source_frames:
-            box = detect_subject(np.array(source_frames[len(source_frames) // 2].convert("RGB")))
-            detections[source] = box
 
     contexts = {}
     for source in paths:
@@ -367,7 +633,7 @@ def create_cutouts(paths: list[Path], job_dir: Path, count: int) -> tuple[list[P
         context = contexts.get(source)
         motion = None if context is None else cv2.cvtColor(cv2.absdiff(np.array(frame.convert("RGB")), context[0]), cv2.COLOR_RGB2GRAY)
         stability = None if context is None else context[1]
-        result = isolate_subject(frame, motion, stability, detections.get(source))
+        result = isolate_subject(frame, motion, stability)
         bounds = result.getchannel("A").getbbox()
         if bounds:
             result = result.crop(bounds)
@@ -578,7 +844,7 @@ def render_floating_video(cutouts: list[Path], samples: list[Path], paths: list[
 def keep_only_output(job_dir: Path, destination: Path | None = None):
     """Keep Render's small ephemeral disk from filling with intermediate clips."""
     for path in job_dir.iterdir():
-        if destination is not None and path == destination:
+        if (destination is not None and path == destination) or path.name == "job.json":
             continue
         if path.is_dir():
             shutil.rmtree(path, ignore_errors=True)
@@ -593,82 +859,119 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return jsonify(status="ok", ffmpeg=shutil.which("ffmpeg") is not None, output=f"{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}", profile="floating-memory-safe")
+    return jsonify(
+        status="ok",
+        ffmpeg=shutil.which("ffmpeg") is not None,
+        output=f"{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}",
+        fps=30,
+        presets=sorted(SUPPORTED_STYLES),
+        profile="section-aware-v2",
+    )
 
 
 @app.post("/api/analyze-audio")
 def analyze_audio():
     audio = request.files.get("audio")
-    style = request.form.get("style", "cinematic")
-    requested_seconds = min(60, max(5, int(request.form.get("duration", "15"))))
+    style = request.form.get("style", "animal_roulette")
+    requested_seconds = requested_duration()
     if not audio or not extension_allowed(audio.filename, ALLOWED_AUDIO):
         abort(400, "Carica una canzone in formato MP3, WAV, M4A, AAC o OGG.")
+    if style not in SUPPORTED_STYLES:
+        abort(400, "Preset non supportato.")
     with tempfile.TemporaryDirectory(prefix="petcut-analysis-") as temp:
         path = Path(temp) / f"audio.{secure_filename(audio.filename).rsplit('.', 1)[1]}"
         audio.save(path)
-        rhythm = analyze_rhythm(path)
-        usable_duration = min(float(requested_seconds), media_duration(path))
-    contents = recommended_content(usable_duration, style)
-    cuts = recommended_scenes(usable_duration, rhythm["edit_bpm"], style)
-    return jsonify(bpm=rhythm["bpm"], edit_bpm=rhythm["edit_bpm"], recommended_content=contents, visual_cuts=cuts, message=(
-        f"Ritmo musicale: circa {rhythm['bpm']} BPM; montaggio a {rhythm['edit_bpm']} BPM. "
-        f"Per {usable_duration:.0f} secondi sono ideali {contents} foto o clip distinti. "
-        f"Se ne carichi uno solo, PetCut creerà comunque circa {cuts} cambi ritmici riutilizzando inquadrature diverse."
-    ))
+        rhythm = analyze_audio_structure(path, requested_seconds)
+    plan = audio_recommendation(style, rhythm["duration"], rhythm)
+    return jsonify(
+        bpm=rhythm["bpm"],
+        edit_bpm=rhythm["edit_bpm"],
+        duration=rhythm["duration"],
+        drop_time=rhythm["drop_time"],
+        sections=rhythm["sections"],
+        phases=plan["phases"],
+        recommended_content=plan["ideal_media"],
+        minimum_content=plan["min_media"],
+        visual_cuts=plan["visual_cuts"],
+        message=plan["note"],
+    )
 
 
 def render_job(job_id, paths, audio_path, style, title, requested_seconds, job_dir):
     try:
-        duration = min(float(requested_seconds), media_duration(audio_path))
-        rhythm = analyze_rhythm(audio_path)
-        edit_bpm = rhythm["edit_bpm"]
-        if style == "floating":
-            cutout_count = max(5, min(7, recommended_scenes(duration, edit_bpm, style)))
+        JOBS[job_id].update(progress=3, stage=0, phase="Analisi del ritmo e delle sezioni musicali")
+        rhythm = analyze_audio_structure(audio_path, float(requested_seconds))
+        duration = min(float(requested_seconds), float(rhythm["duration"]))
+        JOBS[job_id].update(progress=10, stage=1, phase="Selezione delle inquadrature migliori")
+
+        cutouts, samples = None, None
+        if style in CUTOUT_STYLES:
+            # Temporal pose variety prevents the repeated static silhouette that
+            # made the previous renderer look procedural and visibly cheaper.
+            cutout_count = max(8, min(12, len(paths) * 3))
             try:
                 cutouts, samples = create_cutouts(paths, job_dir, cutout_count)
             finally:
                 release_subject_detector()
-            destination = job_dir / "petcut-social-edit.mp4"
-            scene_count = render_floating_video(cutouts, samples, paths, audio_path, job_dir, destination, duration, rhythm, title)
-            JOBS[job_id].update(status="complete", output=str(destination), bpm=rhythm["bpm"], edit_bpm=edit_bpm, scenes=scene_count)
-            keep_only_output(job_dir, destination)
-            return
-        scenes = recommended_scenes(duration, edit_bpm, style)
-        scene_duration = duration / scenes
-        command = ["ffmpeg", "-y"]
-        for path in paths:
-            command.extend((["-loop", "1", "-framerate", "30", "-i", str(path)] if path.suffix[1:] in ALLOWED_IMAGE else ["-stream_loop", "-1", "-i", str(path)]))
-        command.extend(["-i", str(audio_path)])
-        labels, filters = [], []
-        for index in range(scenes):
-            label, input_index = f"s{index}", index % len(paths)
-            source_length = 1 if paths[input_index].suffix[1:] in ALLOWED_IMAGE else media_duration(paths[input_index])
-            start = 0 if source_length <= scene_duration else (source_length - scene_duration) * (index // len(paths)) / max(1, (scenes - 1) // len(paths))
-            filters.append(f"[{input_index}:v]trim=start={start:.3f}:duration={scene_duration:.3f},setpts=PTS-STARTPTS,{scene_filter(index, style, edit_bpm, scene_duration)}[{label}]")
-            labels.append(f"[{label}]")
-        filter_complex = ";".join(filters) + ";" + "".join(labels) + f"concat=n={scenes}:v=1:a=0[m];[m]{final_filter(style, title)}[outv]"
+            JOBS[job_id].update(progress=26, stage=2, phase="Soggetti scontornati e livelli pronti")
+
         destination = job_dir / "petcut-social-edit.mp4"
-        command.extend(["-t", f"{duration:.2f}", "-filter_complex", filter_complex, "-map", "[outv]", "-map", f"{len(paths)}:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(destination)])
-        run(command)
-        JOBS[job_id].update(status="complete", output=str(destination), bpm=rhythm["bpm"], edit_bpm=edit_bpm, scenes=scenes)
+
+        def update_progress(phase, percent):
+            value = max(int(JOBS[job_id].get("progress", 0)), int(percent))
+            stage = 0 if value < 10 else 1 if value < 26 else 2 if value < 94 else 3
+            JOBS[job_id].update(progress=value, stage=stage, phase=phase.capitalize())
+
+        metadata = render_preset(
+            style,
+            paths,
+            audio_path,
+            job_dir,
+            destination,
+            duration,
+            rhythm,
+            title,
+            cutouts=cutouts,
+            samples=samples,
+            progress=update_progress,
+        )
+        JOBS[job_id].update(
+            status="complete",
+            output=str(destination),
+            progress=100,
+            stage=4,
+            phase="Video completato",
+            bpm=rhythm["bpm"],
+            edit_bpm=rhythm["edit_bpm"],
+            drop_time=metadata.get("drop_time", rhythm["drop_time"]),
+            preset=style,
+            scenes=metadata["scenes"],
+        )
+        (job_dir / "job.json").write_text(
+            json.dumps({"job_id": job_id, **{key: value for key, value in JOBS[job_id].items() if key != "output"}}),
+            encoding="utf-8",
+        )
         keep_only_output(job_dir, destination)
     except Exception as error:
         app.logger.exception("Render failed")
         if isinstance(error, subprocess.CalledProcessError):
             app.logger.error(error.stderr)
-        JOBS[job_id].update(status="failed", error="Generazione non riuscita. Prova un video più breve o riprova tra poco.")
+        JOBS[job_id].update(status="failed", phase="Montaggio interrotto", error="Generazione non riuscita. Prova con file più brevi o riprova tra poco.")
         keep_only_output(job_dir)
 
 
 @app.post("/api/render")
 def render_video():
     media, audio = [file for file in request.files.getlist("media") if file and file.filename], request.files.get("audio")
-    style, title = request.form.get("style", "cinematic"), request.form.get("title", "").strip()
-    requested_seconds = min(60, max(5, int(request.form.get("duration", "15"))))
+    style = request.form.get("style", "animal_roulette")
+    title = request.form.get("title", "").strip()[:32]
+    requested_seconds = requested_duration()
     if not media or not audio:
         abort(400, "Carica almeno una foto o un video e una canzone.")
-    if style not in {"cinematic", "beat", "collage", "floating"} or any(not extension_allowed(file.filename, ALLOWED_VIDEO | ALLOWED_IMAGE) for file in media) or not extension_allowed(audio.filename, ALLOWED_AUDIO):
+    if style not in SUPPORTED_STYLES or any(not extension_allowed(file.filename, ALLOWED_VIDEO | ALLOWED_IMAGE) for file in media) or not extension_allowed(audio.filename, ALLOWED_AUDIO):
         abort(400, "Formato o preset non supportato.")
+    if len(media) > 30:
+        abort(400, "Puoi caricare al massimo 30 foto o video per montaggio.")
     job_id, job_dir = uuid.uuid4().hex, OUTPUT_DIR / "jobs" / uuid.uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=True)
     audio_path = job_dir / f"audio.{secure_filename(audio.filename).rsplit('.', 1)[1]}"
@@ -678,7 +981,7 @@ def render_video():
         path = job_dir / f"media-{index}.{secure_filename(file.filename).rsplit('.', 1)[1].lower()}"
         file.save(path)
         paths.append(path)
-    JOBS[job_id] = {"status": "processing"}
+    JOBS[job_id] = {"status": "processing", "progress": 1, "stage": 0, "phase": "File ricevuti"}
     RENDER_QUEUE.submit(render_job, job_id, paths, audio_path, style, title, requested_seconds, job_dir)
     return jsonify(job_id=job_id), 202
 
@@ -687,6 +990,20 @@ def render_video():
 def render_status(job_id):
     job = JOBS.get(job_id)
     if not job:
+        job_root = OUTPUT_DIR / "jobs"
+        for metadata_path in job_root.glob("*/job.json"):
+            try:
+                candidate = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            if candidate.get("job_id") == job_id:
+                output = metadata_path.parent / "petcut-social-edit.mp4"
+                if output.exists():
+                    candidate["output"] = str(output)
+                    JOBS[job_id] = candidate
+                    job = candidate
+                break
+    if not job:
         abort(404, "Job non trovato. Riprova a generare il video.")
     return jsonify({key: value for key, value in job.items() if key != "output"})
 
@@ -694,6 +1011,9 @@ def render_status(job_id):
 @app.get("/api/render/<job_id>/download")
 def download_render(job_id):
     job = JOBS.get(job_id)
+    if not job:
+        render_status(job_id)
+        job = JOBS.get(job_id)
     if not job or job.get("status") != "complete":
         abort(404, "Il video non è ancora pronto.")
     return send_file(job["output"], as_attachment=True, download_name="petcut-social-edit.mp4", mimetype="video/mp4")
@@ -702,6 +1022,14 @@ def download_render(job_id):
 @app.errorhandler(413)
 def too_large(_error):
     return jsonify(error=f"File troppo grande: limite {MAX_UPLOAD_MB} MB."), 413
+
+
+@app.errorhandler(HTTPException)
+def api_http_error(error):
+    """Keep API failures machine-readable so the interface can explain them."""
+    if request.path.startswith("/api/"):
+        return jsonify(error=error.description), error.code
+    return error
 
 
 if __name__ == "__main__":
