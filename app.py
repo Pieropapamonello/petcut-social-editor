@@ -70,14 +70,11 @@ def recommended_scenes(duration: float, bpm: int, style: str) -> int:
     return max(3, min(18, math.ceil(duration / ((60 / bpm) * beats_per_scene))))
 
 
-def visual_filter(style: str, bpm: int, title: str) -> str:
-    frequency = bpm / 60
+def final_filter(style: str, title: str) -> str:
     saturation = {"cinematic": "1.18", "beat": "1.35", "collage": "1.25"}[style]
-    zoom = {"cinematic": "0.045", "beat": "0.080", "collage": "0.060"}[style]
     filters = [
         f"eq=contrast=1.10:saturation={saturation}:brightness=0.015",
         "unsharp=5:5:0.55:5:5:0.0",
-        f"zoompan=z='1.02+{zoom}*(0.5+0.5*sin(2*PI*{frequency:.4f}*on/30))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:fps=30",
     ]
     if style == "collage":
         filters.append("vignette=PI/5")
@@ -87,6 +84,26 @@ def visual_filter(style: str, bpm: int, title: str) -> str:
                        f"text='{clean_title}':fontcolor=white:fontsize=72:borderw=4:bordercolor=black:"
                        "x=(w-text_w)/2:y=h*0.15:enable='between(t,0,2.8)'")
     return ",".join(filters)
+
+
+def scene_filter(index: int, style: str, bpm: int, duration: float) -> str:
+    """A distinct punchy camera move for every beat-sized scene."""
+    strength = {"cinematic": 42, "beat": 105, "collage": 75}[style]
+    direction = index % 4
+    if direction == 0:
+        position = f"x='(in_w-out_w)/2+{strength}*t/{duration:.3f}':y='(in_h-out_h)/2'"
+    elif direction == 1:
+        position = f"x='(in_w-out_w)/2-{strength}*t/{duration:.3f}':y='(in_h-out_h)/2'"
+    elif direction == 2:
+        position = f"x='(in_w-out_w)/2':y='(in_h-out_h)/2+{strength}*t/{duration:.3f}'"
+    else:
+        position = f"x='(in_w-out_w)/2':y='(in_h-out_h)/2-{strength}*t/{duration:.3f}'"
+    flash = "drawbox=color=white@0.72:t=fill:enable='between(t\\,0\\,0.045)'" if index else "null"
+    contrast = "1.18" if style == "beat" and index % 2 else "1.08"
+    return (
+        f"scale=900:1600:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:{position},"
+        f"eq=contrast={contrast}:saturation={'1.28' if style == 'beat' else '1.14'},fps=30,{flash}"
+    )
 
 
 @app.get("/")
@@ -122,21 +139,17 @@ def render_job(job_id, paths, audio_path, style, title, requested_seconds, job_d
         duration, bpm = min(float(requested_seconds), media_duration(audio_path)), estimate_bpm(audio_path)
         scenes, scene_duration = recommended_scenes(duration, bpm, style), duration / recommended_scenes(duration, bpm, style)
         command = ["ffmpeg", "-y"]
-        if len(paths) == 1:
-            path = paths[0]
+        for path in paths:
             command.extend((["-loop", "1", "-framerate", "30", "-i", str(path)] if path.suffix[1:] in ALLOWED_IMAGE else ["-stream_loop", "-1", "-i", str(path)]))
-            command.extend(["-i", str(audio_path)])
-            filter_complex = f"[0:v]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1,fps=30,{visual_filter(style, bpm, title)}[outv]"
-        else:
-            for path in paths:
-                command.extend((["-loop", "1", "-framerate", "30", "-i", str(path)] if path.suffix[1:] in ALLOWED_IMAGE else ["-stream_loop", "-1", "-i", str(path)]))
-            command.extend(["-i", str(audio_path)])
-            labels, filters = [], []
-            for index in range(scenes):
-                label, input_index = f"s{index}", index % len(paths)
-                filters.append(f"[{input_index}:v]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1,fps=30,trim=duration={scene_duration:.3f},setpts=PTS-STARTPTS[{label}]")
-                labels.append(f"[{label}]")
-            filter_complex = ";".join(filters) + ";" + "".join(labels) + f"concat=n={scenes}:v=1:a=0[m];[m]{visual_filter(style, bpm, title)}[outv]"
+        command.extend(["-i", str(audio_path)])
+        labels, filters = [], []
+        for index in range(scenes):
+            label, input_index = f"s{index}", index % len(paths)
+            source_length = 1 if paths[input_index].suffix[1:] in ALLOWED_IMAGE else media_duration(paths[input_index])
+            start = 0 if source_length <= scene_duration else (source_length - scene_duration) * (index // len(paths)) / max(1, (scenes - 1) // len(paths))
+            filters.append(f"[{input_index}:v]trim=start={start:.3f}:duration={scene_duration:.3f},setpts=PTS-STARTPTS,{scene_filter(index, style, bpm, scene_duration)}[{label}]")
+            labels.append(f"[{label}]")
+        filter_complex = ";".join(filters) + ";" + "".join(labels) + f"concat=n={scenes}:v=1:a=0[m];[m]{final_filter(style, title)}[outv]"
         destination = job_dir / "petcut-social-edit.mp4"
         command.extend(["-t", f"{duration:.2f}", "-filter_complex", filter_complex, "-map", "[outv]", "-map", f"{len(paths)}:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(destination)])
         run(command)
