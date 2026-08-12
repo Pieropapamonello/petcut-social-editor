@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import cv2
 from flask import Flask, abort, jsonify, render_template, request, send_file
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from werkzeug.utils import secure_filename
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -189,6 +189,51 @@ def floating_filter(cutouts: list[Path], raw_source: Path | None, duration: floa
     return command, ";".join(filters)
 
 
+def create_floating_scenes(cutouts: list[Path], job_dir: Path, duration: float, bpm: int, title: str) -> tuple[list[Path], float]:
+    """Pre-compose each black canvas in PIL, avoiding a memory-heavy FFmpeg overlay graph."""
+    floating_duration = duration * 0.72
+    scene_count = max(4, min(len(cutouts), recommended_scenes(floating_duration, bpm, "floating")))
+    scene_duration = floating_duration / scene_count
+    positions = [(132, 230), (285, 480), (75, 580), (350, 205)]
+    font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 62)
+    safe_title = re.sub(r"[^A-Za-z0-9 !?-]", "", title or "FLOATING")[:24].upper()
+    files = []
+    for index in range(scene_count):
+        canvas = Image.new("RGB", (OUTPUT_WIDTH, OUTPUT_HEIGHT), "black")
+        layers = 1 if index < 2 else (2 if index % 3 else 3)
+        for layer in range(layers):
+            cutout = Image.open(cutouts[(index + layer * 2) % len(cutouts)]).convert("RGBA")
+            width = 455 if layer == 0 else 255
+            cutout.thumbnail((width, 750 if layer == 0 else 430), Image.Resampling.LANCZOS)
+            x, y = positions[(index + layer) % len(positions)]
+            canvas.paste(cutout, (x, y), cutout)
+        if index < 2:
+            draw = ImageDraw.Draw(canvas)
+            left, top, right, bottom = draw.textbbox((0, 0), safe_title, font=font, stroke_width=2)
+            draw.text(((OUTPUT_WIDTH - (right - left)) / 2, 970), safe_title, font=font, fill="white", stroke_width=2, stroke_fill="black")
+        destination = job_dir / f"floating-scene-{index}.jpg"
+        canvas.save(destination, quality=94)
+        files.append(destination)
+    return files, scene_duration
+
+
+def render_floating_video(cutouts: list[Path], raw_source: Path | None, audio_path: Path, job_dir: Path, destination: Path, duration: float, bpm: int, title: str):
+    scenes, scene_duration = create_floating_scenes(cutouts, job_dir, duration, bpm, title)
+    stage_list = job_dir / "stage.txt"
+    stage_list.write_text("".join(f"file '{path.as_posix()}'\nduration {scene_duration:.3f}\n" for path in scenes) + f"file '{scenes[-1].as_posix()}'\n", encoding="utf-8")
+    stage = job_dir / "stage.mp4"
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(stage_list), "-r", "30", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", str(stage)])
+    clips = [stage]
+    if raw_source is not None:
+        reveal_duration = duration - scene_duration * len(scenes)
+        reveal = job_dir / "reveal.mp4"
+        run(["ffmpeg", "-y", "-stream_loop", "-1", "-i", str(raw_source), "-t", f"{reveal_duration:.3f}", "-vf", f"scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1,fps=30", "-pix_fmt", "yuv420p", "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", str(reveal)])
+        clips.append(reveal)
+    clips_list = job_dir / "clips.txt"
+    clips_list.write_text("".join(f"file '{path.as_posix()}'\n" for path in clips), encoding="utf-8")
+    run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(clips_list), "-i", str(audio_path), "-t", f"{duration:.3f}", "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(destination)])
+
+
 @app.get("/")
 def index():
     return render_template("index.html", max_upload_mb=MAX_UPLOAD_MB)
@@ -224,11 +269,8 @@ def render_job(job_id, paths, audio_path, style, title, requested_seconds, job_d
             cutout_count = max(5, min(9, recommended_scenes(duration, bpm, style)))
             cutouts = create_cutouts(paths, job_dir, cutout_count)
             raw_source = next((path for path in paths if path.suffix[1:] in ALLOWED_VIDEO), None)
-            command, filter_complex = floating_filter(cutouts, raw_source, duration, bpm, title)
             destination = job_dir / "petcut-social-edit.mp4"
-            audio_index = len(cutouts) + 1 + (1 if raw_source else 0)
-            command.extend(["-i", str(audio_path), "-t", f"{duration:.2f}", "-filter_complex", filter_complex, "-map", "[outv]", "-map", f"{audio_index}:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(destination)])
-            run(command)
+            render_floating_video(cutouts, raw_source, audio_path, job_dir, destination, duration, bpm, title)
             JOBS[job_id].update(status="complete", output=str(destination), bpm=bpm, scenes=cutout_count)
             return
         scenes, scene_duration = recommended_scenes(duration, bpm, style), duration / recommended_scenes(duration, bpm, style)
