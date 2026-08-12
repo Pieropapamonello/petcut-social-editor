@@ -4,6 +4,16 @@ const status = document.querySelector('#status');
 const analysis = document.querySelector('#song-analysis');
 const audioInput = form.elements.audio;
 
+async function responseError(response, fallback) {
+  const contentType = response.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) {
+    const body = await response.json().catch(() => ({}));
+    return body.error || fallback;
+  }
+  if (response.status >= 500) return 'Il server sta completando l’avvio o è momentaneamente occupato. Attendi un minuto e riprova.';
+  return fallback;
+}
+
 async function analyzeSong() {
   if (!audioInput.files[0]) return;
   analysis.textContent = 'Analisi del ritmo in corso…';
@@ -28,12 +38,13 @@ form.addEventListener('submit', async (event) => {
   status.textContent = 'Preparazione dell’edit…';
   try {
     const response = await fetch('/api/render', { method: 'POST', body: new FormData(form) });
-    if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || 'Generazione non riuscita.');
+    if (!response.ok) throw new Error(await responseError(response, 'Generazione non riuscita.'));
     const { job_id: jobId } = await response.json();
     let job;
     do {
       await new Promise((resolve) => setTimeout(resolve, 2500));
       const progress = await fetch(`/api/render/${jobId}`);
+      if (!progress.ok) throw new Error(await responseError(progress, 'Non riesco a controllare lo stato del montaggio.'));
       job = await progress.json();
       status.textContent = job.status === 'complete' ? 'Video pronto: avvio il download…' : 'Montaggio in corso: puoi lasciare aperta questa pagina.';
     } while (job.status === 'processing');
