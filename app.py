@@ -1,6 +1,7 @@
 import math
 import os
 import re
+import gc
 import shutil
 import subprocess
 import tempfile
@@ -25,8 +26,10 @@ ALLOWED_VIDEO = {"mp4", "mov", "m4v", "webm"}
 ALLOWED_IMAGE = {"jpg", "jpeg", "png", "webp"}
 ALLOWED_AUDIO = {"mp3", "wav", "m4a", "aac", "ogg"}
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
-OUTPUT_WIDTH = 720
-OUTPUT_HEIGHT = 1280
+# The visual reference itself is 576x1024. Matching it also keeps peak memory
+# safely below Render Free's limit while retaining a crisp 9:16 social export.
+OUTPUT_WIDTH = 576
+OUTPUT_HEIGHT = 1024
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
@@ -256,6 +259,13 @@ def detect_subject(rgb: np.ndarray) -> tuple[int, int, int, int]:
     return int(width * 0.12), int(height * 0.08), int(width * 0.76), int(height * 0.86)
 
 
+def release_subject_detector():
+    global SUBJECT_NET
+    with SUBJECT_NET_LOCK:
+        SUBJECT_NET = None
+    gc.collect()
+
+
 def isolate_subject(frame: Image.Image, motion: np.ndarray | None = None, stability: np.ndarray | None = None, subject_box: tuple[int, int, int, int] | None = None) -> Image.Image:
     """Detector and temporal-guided GrabCut with a conservative colour trimap."""
     rgb = np.array(frame.convert("RGB"))
@@ -340,8 +350,8 @@ def create_cutouts(paths: list[Path], job_dir: Path, count: int) -> tuple[list[P
     for source in paths:
         source_frames = [frame for record_source, frame in records if record_source == source]
         if source_frames:
-            boxes = [detect_subject(np.array(frame.convert("RGB"))) for frame in source_frames]
-            detections[source] = tuple(int(np.median([box[position] for box in boxes])) for position in range(4))
+            box = detect_subject(np.array(source_frames[len(source_frames) // 2].convert("RGB")))
+            detections[source] = box
 
     contexts = {}
     for source in paths:
@@ -380,10 +390,10 @@ def draw_centered_phrase(draw: ImageDraw.ImageDraw, words: list[str], y: int):
         split_at = math.ceil(len(words) / 2)
         lines = [" ".join(words[:split_at]), " ".join(words[split_at:])]
     text = "\n".join(lines)
-    for size in range(58, 31, -2):
+    for size in range(46, 25, -2):
         font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
         box = draw.multiline_textbbox((0, 0), text, font=font, spacing=4, stroke_width=2, align="center")
-        if box[2] - box[0] <= OUTPUT_WIDTH - 70:
+        if box[2] - box[0] <= OUTPUT_WIDTH - 56:
             break
     width = box[2] - box[0]
     draw.multiline_text(((OUTPUT_WIDTH - width) / 2, y), text, font=font, fill="white", spacing=4, stroke_width=2, stroke_fill="black", align="center")
@@ -391,9 +401,16 @@ def draw_centered_phrase(draw: ImageDraw.ImageDraw, words: list[str], y: int):
 
 def make_social_storyboards(cutouts: list[Path], samples: list[Path], job_dir: Path, title: str, intro_count: int, roulette_count: int, collage_count: int) -> list[Path]:
     """Create varied stills for intro, roulette, and progressive word collage."""
-    font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 82)
+    font_large = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 66)
     words = split_title_words(title)
-    positions = [(80, 175), (355, 220), (85, 650), (370, 700), (220, 410), (30, 440)]
+    positions = [
+        (int(OUTPUT_WIDTH * 0.10), int(OUTPUT_HEIGHT * 0.13)),
+        (int(OUTPUT_WIDTH * 0.51), int(OUTPUT_HEIGHT * 0.17)),
+        (int(OUTPUT_WIDTH * 0.10), int(OUTPUT_HEIGHT * 0.52)),
+        (int(OUTPUT_WIDTH * 0.52), int(OUTPUT_HEIGHT * 0.56)),
+        (int(OUTPUT_WIDTH * 0.31), int(OUTPUT_HEIGHT * 0.32)),
+        (int(OUTPUT_WIDTH * 0.04), int(OUTPUT_HEIGHT * 0.35)),
+    ]
     count = intro_count + roulette_count + collage_count
     collage_start = intro_count + roulette_count
     clean_title = re.sub(r"[^A-Za-z0-9 !?-]", "", title).strip().upper()
@@ -420,12 +437,12 @@ def make_social_storyboards(cutouts: list[Path], samples: list[Path], job_dir: P
             if roulette:
                 angle = (-12, 7, 14, -6)[(index + layer) % 4]
                 cutout = cutout.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True)
-            single_sizes = ((390, 640), (540, 850), (450, 720), (590, 900))
-            max_size = single_sizes[index % len(single_sizes)] if layers == 1 else (290, 460)
+            single_sizes = ((312, 512), (432, 680), (360, 576), (472, 720))
+            max_size = single_sizes[index % len(single_sizes)] if layers == 1 else (232, 368)
             cutout.thumbnail(max_size, Image.Resampling.LANCZOS)
             if layers == 1:
                 x = int((OUTPUT_WIDTH - cutout.width) / 2 + ((index % 3) - 1) * 55)
-                y = int((OUTPUT_HEIGHT - cutout.height) / 2 - 45)
+                y = int((OUTPUT_HEIGHT - cutout.height) / 2 - OUTPUT_HEIGHT * 0.035)
             else:
                 x, y = positions[(index + layer) % len(positions)]
             rim_alpha = cutout.getchannel("A").filter(ImageFilter.MaxFilter(7))
@@ -438,16 +455,16 @@ def make_social_storyboards(cutouts: list[Path], samples: list[Path], job_dir: P
         if index < intro_count:
             label = intro_labels[index % len(intro_labels)]
             box = draw.textbbox((0, 0), label, font=font_large, stroke_width=3)
-            draw.text(((OUTPUT_WIDTH - (box[2] - box[0])) / 2, 920), label, font=font_large, fill="white", stroke_width=3, stroke_fill="black")
+            draw.text(((OUTPUT_WIDTH - (box[2] - box[0])) / 2, int(OUTPUT_HEIGHT * 0.72)), label, font=font_large, fill="white", stroke_width=3, stroke_fill="black")
         elif index >= collage_start:
             word_index = min(len(words) - 1, index - collage_start)
             word = words[word_index]
-            for size in range(92, 45, -2):
+            for size in range(74, 35, -2):
                 word_font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", size)
                 box = draw.textbbox((0, 0), word, font=word_font, stroke_width=3)
-                if box[2] - box[0] <= 480:
+                if box[2] - box[0] <= OUTPUT_WIDTH - 76:
                     break
-            draw.text(((OUTPUT_WIDTH - (box[2] - box[0])) / 2, 940), word, font=word_font, fill="white", stroke_width=3, stroke_fill="black")
+            draw.text(((OUTPUT_WIDTH - (box[2] - box[0])) / 2, int(OUTPUT_HEIGHT * 0.735)), word, font=word_font, fill="white", stroke_width=3, stroke_fill="black")
         destination = job_dir / f"story-{index:02d}.jpg"
         canvas.save(destination, quality=96)
         boards.append(destination)
@@ -463,12 +480,12 @@ def render_still_clip(image_path: Path, destination: Path, duration: float, inde
     if flash:
         filters.append("drawbox=color=white@0.52:t=fill:enable='lt(t,0.040)'")
     frame_count = max(1, round(duration * 30))
-    run(["ffmpeg", "-y", "-loop", "1", "-framerate", "30", "-i", str(image_path), "-frames:v", str(frame_count), "-vf", ",".join(filters), "-an", "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", "-g", "15", "-keyint_min", "1", "-sc_threshold", "0", str(destination)])
+    run(["ffmpeg", "-y", "-loop", "1", "-framerate", "30", "-i", str(image_path), "-frames:v", str(frame_count), "-vf", ",".join(filters), "-an", "-r", "30", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-threads", "1", "-pix_fmt", "yuv420p", "-g", "15", "-keyint_min", "1", "-sc_threshold", "0", str(destination)])
 
 
 def render_action_clip(source: Path, destination: Path, start: float, duration: float, index: int, flash: bool = False):
-    scale = (800, 980, 1160, 880)[index % 4]
-    movement = 34 + (index % 4) * 13
+    scale = (620, 720, 820, 660)[index % 4]
+    movement = 27 + (index % 4) * 10
     x = f"(in_w-out_w)/2+{movement}*sin(PI*t/{max(duration, 0.1):.3f})"
     y = f"(in_h-out_h)/2+{movement // 2}*cos(PI*t/{max(duration, 0.1):.3f})"
     speed = (1.0, 1.35, 0.82, 1.12)[index % 4]
@@ -479,15 +496,15 @@ def render_action_clip(source: Path, destination: Path, start: float, duration: 
     frame_count = max(1, round(duration * 30))
     filters.extend([
         f"scale={scale}:{round(scale * 16 / 9)}:force_original_aspect_ratio=increase",
-        f"rotate='{angle}*PI/180*sin(PI*t/{max(duration, 0.1):.3f})':ow=iw:oh=ih:fillcolor=black",
-        f"crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:x='{x}':y='{y}',setsar=1,fps=30",
+        f"crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:x='{x}':y='{y}'",
+        f"rotate='{angle}*PI/180*sin(PI*t/{max(duration, 0.1):.3f})':ow=iw:oh=ih:fillcolor=black,setsar=1,fps=30",
         f"zoompan=z='1+0.16*sin(PI*on/{frame_count})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:fps=30",
         "eq=contrast=1.12:saturation=1.24",
         "unsharp=5:5:0.5",
     ])
     if flash:
         filters.extend(["gblur=sigma=8:enable='lt(t,0.065)'", "drawbox=color=white@0.58:t=fill:enable='lt(t,0.040)'"])
-    run(["ffmpeg", "-y", "-stream_loop", "-1", "-ss", f"{start:.3f}", "-i", str(source), "-frames:v", str(frame_count), "-vf", ",".join(filters), "-an", "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p", "-g", "15", "-keyint_min", "1", "-sc_threshold", "0", str(destination)])
+    run(["ffmpeg", "-y", "-stream_loop", "-1", "-ss", f"{start:.3f}", "-i", str(source), "-frames:v", str(frame_count), "-vf", ",".join(filters), "-an", "-r", "30", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-threads", "1", "-pix_fmt", "yuv420p", "-g", "15", "-keyint_min", "1", "-sc_threshold", "0", str(destination)])
 
 
 def rhythmic_durations(start: float, end: float, count: int, onsets: list[float]) -> list[float]:
@@ -576,7 +593,7 @@ def index():
 
 @app.get("/api/health")
 def health():
-    return jsonify(status="ok", ffmpeg=shutil.which("ffmpeg") is not None)
+    return jsonify(status="ok", ffmpeg=shutil.which("ffmpeg") is not None, output=f"{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}", profile="floating-memory-safe")
 
 
 @app.post("/api/analyze-audio")
@@ -606,8 +623,11 @@ def render_job(job_id, paths, audio_path, style, title, requested_seconds, job_d
         rhythm = analyze_rhythm(audio_path)
         edit_bpm = rhythm["edit_bpm"]
         if style == "floating":
-            cutout_count = max(7, min(9, recommended_scenes(duration, edit_bpm, style)))
-            cutouts, samples = create_cutouts(paths, job_dir, cutout_count)
+            cutout_count = max(5, min(7, recommended_scenes(duration, edit_bpm, style)))
+            try:
+                cutouts, samples = create_cutouts(paths, job_dir, cutout_count)
+            finally:
+                release_subject_detector()
             destination = job_dir / "petcut-social-edit.mp4"
             scene_count = render_floating_video(cutouts, samples, paths, audio_path, job_dir, destination, duration, rhythm, title)
             JOBS[job_id].update(status="complete", output=str(destination), bpm=rhythm["bpm"], edit_bpm=edit_bpm, scenes=scene_count)

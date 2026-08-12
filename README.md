@@ -1,6 +1,6 @@
 # PetCut Social Editor
 
-Web app Flask che trasforma una o più foto/video e una canzone in un MP4 verticale 9:16 (720×1280), pronto per Reels e TikTok.
+Web app Flask che trasforma una o più foto/video e una canzone in un MP4 verticale 9:16 (576×1024), pronto per Reels e TikTok.
 
 L'app analizza sia il BPM musicale sia gli attacchi del brano. Se la canzone è lenta, usa un tempo di montaggio più rapido e aggancia tagli, flash e cambi d'inquadratura agli onset rilevati. L'interfaccia suggerisce quanti contenuti distinti usare, ma funziona anche con una sola foto o un solo video.
 
