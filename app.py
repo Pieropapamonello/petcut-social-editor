@@ -19,6 +19,8 @@ ALLOWED_VIDEO = {"mp4", "mov", "m4v", "webm"}
 ALLOWED_IMAGE = {"jpg", "jpeg", "png", "webp"}
 ALLOWED_AUDIO = {"mp3", "wav", "m4a", "aac", "ogg"}
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
+OUTPUT_WIDTH = 720
+OUTPUT_HEIGHT = 1280
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
@@ -72,7 +74,7 @@ def visual_filter(style: str, bpm: int, title: str) -> str:
     filters = [
         f"eq=contrast=1.10:saturation={saturation}:brightness=0.015",
         "unsharp=5:5:0.55:5:5:0.0",
-        f"zoompan=z='1.02+{zoom}*(0.5+0.5*sin(2*PI*{frequency:.4f}*on/30))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30",
+        f"zoompan=z='1.02+{zoom}*(0.5+0.5*sin(2*PI*{frequency:.4f}*on/30))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:fps=30",
     ]
     if style == "collage":
         filters.append("vignette=PI/5")
@@ -142,7 +144,7 @@ def render_video():
             path = paths[0]
             command.extend((["-loop", "1", "-framerate", "30", "-i", str(path)] if path.suffix[1:] in ALLOWED_IMAGE else ["-stream_loop", "-1", "-i", str(path)]))
             command.extend(["-i", str(audio_path)])
-            filter_complex = f"[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,{visual_filter(style, bpm, title)}[outv]"
+            filter_complex = f"[0:v]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1,fps=30,{visual_filter(style, bpm, title)}[outv]"
         else:
             for path in paths:
                 command.extend((["-loop", "1", "-framerate", "30", "-i", str(path)] if path.suffix[1:] in ALLOWED_IMAGE else ["-stream_loop", "-1", "-i", str(path)]))
@@ -150,7 +152,7 @@ def render_video():
             labels, filters = [], []
             for index in range(scenes):
                 label, input_index = f"s{index}", index % len(paths)
-                filters.append(f"[{input_index}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30,trim=duration={scene_duration:.3f},setpts=PTS-STARTPTS[{label}]")
+                filters.append(f"[{input_index}:v]scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1,fps=30,trim=duration={scene_duration:.3f},setpts=PTS-STARTPTS[{label}]")
                 labels.append(f"[{label}]")
             filter_complex = ";".join(filters) + ";" + "".join(labels) + f"concat=n={scenes}:v=1:a=0[m];[m]{visual_filter(style, bpm, title)}[outv]"
         destination = OUTPUT_DIR / f"petcut-{uuid.uuid4().hex}.mp4"
