@@ -7,10 +7,13 @@ import tempfile
 import uuid
 import wave
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from pathlib import Path
 
 import numpy as np
 from flask import Flask, abort, jsonify, render_template, request, send_file
+from PIL import Image
+from rembg import new_session, remove
 from werkzeug.utils import secure_filename
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -27,6 +30,7 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 JOBS = {}
 RENDER_QUEUE = ThreadPoolExecutor(max_workers=1)
+REMOVAL_SESSION = None
 
 
 def extension_allowed(filename, allowed):
@@ -66,17 +70,17 @@ def estimate_bpm(audio_path: Path) -> int:
 
 
 def recommended_scenes(duration: float, bpm: int, style: str) -> int:
-    beats_per_scene = {"cinematic": 4, "beat": 2, "collage": 2}.get(style, 3)
+    beats_per_scene = {"cinematic": 4, "beat": 2, "collage": 2, "floating": 3}.get(style, 3)
     return max(3, min(18, math.ceil(duration / ((60 / bpm) * beats_per_scene))))
 
 
 def final_filter(style: str, title: str) -> str:
-    saturation = {"cinematic": "1.18", "beat": "1.35", "collage": "1.25"}[style]
+    saturation = {"cinematic": "1.18", "beat": "1.35", "collage": "1.25", "floating": "1.12"}[style]
     filters = [
         f"eq=contrast=1.10:saturation={saturation}:brightness=0.015",
         "unsharp=5:5:0.55:5:5:0.0",
     ]
-    if style == "collage":
+    if style in {"collage", "floating"}:
         filters.append("vignette=PI/5")
     clean_title = re.sub(r"[^A-Za-z0-9 !?-]", "", title)[:32]
     if clean_title:
@@ -88,7 +92,7 @@ def final_filter(style: str, title: str) -> str:
 
 def scene_filter(index: int, style: str, bpm: int, duration: float) -> str:
     """A distinct punchy camera move for every beat-sized scene."""
-    strength = {"cinematic": 42, "beat": 105, "collage": 75}[style]
+    strength = {"cinematic": 42, "beat": 105, "collage": 75, "floating": 65}[style]
     direction = index % 4
     if direction == 0:
         position = f"x='(in_w-out_w)/2+{strength}*t/{duration:.3f}':y='(in_h-out_h)/2'"
@@ -104,6 +108,84 @@ def scene_filter(index: int, style: str, bpm: int, duration: float) -> str:
         f"scale=900:1600:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:{position},"
         f"eq=contrast={contrast}:saturation={'1.28' if style == 'beat' else '1.14'},fps=30,{flash}"
     )
+
+
+def removal_session():
+    global REMOVAL_SESSION
+    if REMOVAL_SESSION is None:
+        REMOVAL_SESSION = new_session("u2netp")
+    return REMOVAL_SESSION
+
+
+def source_frame(path: Path, frame_number: int, frame_count: int) -> Image.Image:
+    if path.suffix[1:].lower() in ALLOWED_IMAGE:
+        return Image.open(path).convert("RGBA")
+    length = media_duration(path)
+    timestamp = max(0.08, min(length - 0.08, length * (frame_number + 1) / (frame_count + 1)))
+    result = subprocess.run(
+        ["ffmpeg", "-v", "error", "-ss", f"{timestamp:.3f}", "-i", str(path), "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=True,
+    )
+    return Image.open(BytesIO(result.stdout)).convert("RGBA")
+
+
+def create_cutouts(paths: list[Path], job_dir: Path, count: int) -> list[Path]:
+    """Sample source media and remove the background for the Floating Cutout preset."""
+    cutouts = []
+    for index in range(count):
+        source = paths[index % len(paths)]
+        frame = source_frame(source, index // len(paths), max(1, math.ceil(count / len(paths))))
+        result = remove(frame, session=removal_session()).convert("RGBA")
+        bounds = result.getchannel("A").getbbox()
+        if bounds:
+            result = result.crop(bounds)
+        result.thumbnail((520, 820), Image.Resampling.LANCZOS)
+        destination = job_dir / f"cutout-{index}.png"
+        result.save(destination)
+        cutouts.append(destination)
+    return cutouts
+
+
+def floating_filter(cutouts: list[Path], raw_source: Path | None, duration: float, bpm: int, title: str) -> tuple[list[str], str]:
+    """Build the black-background floating composition used by the reference edits."""
+    floating_duration = duration if raw_source is None else max(3.5, duration * 0.72)
+    scene_count = max(4, min(len(cutouts), recommended_scenes(floating_duration, bpm, "floating")))
+    scene_duration = floating_duration / scene_count
+    command = ["ffmpeg", "-y", "-f", "lavfi", "-t", f"{duration:.3f}", "-i", f"color=c=black:s={OUTPUT_WIDTH}x{OUTPUT_HEIGHT}:r=30"]
+    for cutout in cutouts:
+        command.extend(["-loop", "1", "-framerate", "30", "-i", str(cutout)])
+    raw_index = None
+    if raw_source is not None:
+        raw_index = len(cutouts) + 1
+        command.extend(["-stream_loop", "-1", "-i", str(raw_source)])
+    labels, filters = [], []
+    positions = [("(main_w-overlay_w)/2", "(main_h-overlay_h)/2"), ("main_w*0.12", "main_h*0.17"), ("main_w*0.54", "main_h*0.43"), ("main_w*0.27", "main_h*0.52")]
+    for index in range(scene_count):
+        background, output = f"bg{index}", f"f{index}"
+        filters.append(f"[0:v]trim=duration={scene_duration:.3f},setpts=PTS-STARTPTS[{background}]")
+        overlay_base = background
+        cutout_count = 1 if index < 2 else (2 if index % 3 else 3)
+        for layer in range(cutout_count):
+            cutout_index = (index + layer * 2) % len(cutouts) + 1
+            width = 455 if layer == 0 else 260
+            cut_label = f"c{index}_{layer}"
+            x, y = positions[(index + layer) % len(positions)]
+            filters.append(f"[{cutout_index}:v]format=rgba,scale={width}:-1,fade=t=in:st=0:d=0.12:alpha=1,fade=t=out:st={max(0.1, scene_duration - 0.10):.3f}:d=0.10:alpha=1[{cut_label}]")
+            next_overlay = output if layer == cutout_count - 1 else f"o{index}_{layer}"
+            filters.append(f"[{overlay_base}][{cut_label}]overlay=x='{x}':y='{y}':shortest=1:format=auto,setsar=1[{next_overlay}]")
+            overlay_base = next_overlay
+        labels.append(f"[{output}]")
+    if raw_index is not None:
+        reveal_duration = duration - floating_duration
+        filters.append(f"[{raw_index}:v]trim=duration={reveal_duration:.3f},setpts=PTS-STARTPTS,scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:force_original_aspect_ratio=increase,crop={OUTPUT_WIDTH}:{OUTPUT_HEIGHT},setsar=1,fps=30[reveal]")
+        labels.append("[reveal]")
+        scene_count += 1
+    safe_title = re.sub(r"[^A-Za-z0-9 !?-]", "", title or "FLOATING")[:24].upper()
+    filters.append("".join(labels) + f"concat=n={scene_count}:v=1:a=0[sequence]")
+    filters.append(f"[sequence]drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='{safe_title}':fontcolor=white:fontsize=68:borderw=3:bordercolor=black:x=(w-text_w)/2:y=h*0.77:enable='between(t,0.3,2.0)',eq=contrast=1.08:saturation=1.16,format=yuv420p[outv]")
+    return command, ";".join(filters)
 
 
 @app.get("/")
@@ -137,6 +219,17 @@ def analyze_audio():
 def render_job(job_id, paths, audio_path, style, title, requested_seconds, job_dir):
     try:
         duration, bpm = min(float(requested_seconds), media_duration(audio_path)), estimate_bpm(audio_path)
+        if style == "floating":
+            cutout_count = max(5, min(9, recommended_scenes(duration, bpm, style)))
+            cutouts = create_cutouts(paths, job_dir, cutout_count)
+            raw_source = next((path for path in paths if path.suffix[1:] in ALLOWED_VIDEO), None)
+            command, filter_complex = floating_filter(cutouts, raw_source, duration, bpm, title)
+            destination = job_dir / "petcut-social-edit.mp4"
+            audio_index = len(cutouts) + 1 + (1 if raw_source else 0)
+            command.extend(["-i", str(audio_path), "-t", f"{duration:.2f}", "-filter_complex", filter_complex, "-map", "[outv]", "-map", f"{audio_index}:a:0", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(destination)])
+            run(command)
+            JOBS[job_id].update(status="complete", output=str(destination), bpm=bpm, scenes=cutout_count)
+            return
         scenes, scene_duration = recommended_scenes(duration, bpm, style), duration / recommended_scenes(duration, bpm, style)
         command = ["ffmpeg", "-y"]
         for path in paths:
@@ -156,6 +249,8 @@ def render_job(job_id, paths, audio_path, style, title, requested_seconds, job_d
         JOBS[job_id].update(status="complete", output=str(destination), bpm=bpm, scenes=scenes)
     except Exception as error:
         app.logger.exception("Render failed")
+        if isinstance(error, subprocess.CalledProcessError):
+            app.logger.error(error.stderr)
         JOBS[job_id].update(status="failed", error="Generazione non riuscita. Prova un video più breve o riprova tra poco.")
 
 
@@ -166,7 +261,7 @@ def render_video():
     requested_seconds = min(60, max(5, int(request.form.get("duration", "15"))))
     if not media or not audio:
         abort(400, "Carica almeno una foto o un video e una canzone.")
-    if style not in {"cinematic", "beat", "collage"} or any(not extension_allowed(file.filename, ALLOWED_VIDEO | ALLOWED_IMAGE) for file in media) or not extension_allowed(audio.filename, ALLOWED_AUDIO):
+    if style not in {"cinematic", "beat", "collage", "floating"} or any(not extension_allowed(file.filename, ALLOWED_VIDEO | ALLOWED_IMAGE) for file in media) or not extension_allowed(audio.filename, ALLOWED_AUDIO):
         abort(400, "Formato o preset non supportato.")
     job_id, job_dir = uuid.uuid4().hex, OUTPUT_DIR / "jobs" / uuid.uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=True)

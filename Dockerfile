@@ -6,6 +6,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 RUN mkdir -p /app/data/exports
-ENV PYTHONUNBUFFERED=1 PORT=10000
+ENV PYTHONUNBUFFERED=1 PORT=10000 U2NET_HOME=/opt/rembg
+RUN python -c "from rembg import new_session; new_session('u2netp')"
 EXPOSE 10000
 CMD ["gunicorn", "--bind", "0.0.0.0:10000", "--workers", "1", "--timeout", "180", "app:app"]
