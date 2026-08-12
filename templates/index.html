@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PetCut — Social video editor</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+  </head>
+  <body>
+    <main class="shell">
+      <p class="eyebrow">PETCUT STUDIO</p>
+      <h1>Trasforma un momento<br />in un social edit.</h1>
+      <p class="intro">Carica un video e una canzone: PetCut crea un video verticale ritmato, pronto per Reels e TikTok.</p>
+      <form id="editor-form">
+        <label>Video <input type="file" name="video" accept="video/mp4,video/quicktime,video/webm" required /></label>
+        <label>Canzone <input type="file" name="audio" accept="audio/mpeg,audio/wav,audio/mp4,audio/aac,audio/ogg" required /></label>
+        <div class="grid">
+          <label>Stile
+            <select name="style"><option value="cinematic">Cinematic Zoom</option><option value="beat">Fast Beat Edit</option><option value="collage">CapCut Collage</option></select>
+          </label>
+          <label>Durata
+            <select name="duration"><option value="10">10 secondi</option><option value="15" selected>15 secondi</option><option value="30">30 secondi</option><option value="60">60 secondi</option></select>
+          </label>
+        </div>
+        <label>Testo iniziale <span>(facoltativo)</span><input name="title" maxlength="32" placeholder="es. IL MIO CANE" /></label>
+        <button type="submit">Genera il mio edit</button>
+        <p id="status" aria-live="polite">Limite di caricamento: {{ max_upload_mb }} MB per richiesta.</p>
+      </form>
+    </main>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>

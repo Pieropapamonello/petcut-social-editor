@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: petcut-social-editor
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: MAX_UPLOAD_MB
+        value: 200

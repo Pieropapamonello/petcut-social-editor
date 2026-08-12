@@ -1,0 +1,14 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; color: #f7f4ed; font-family: 'Space Grotesk', sans-serif; background: radial-gradient(circle at 80% 5%, #b6492a, transparent 28rem), #151312; }
+.shell { width: min(700px, calc(100% - 40px)); margin: 0 auto; padding: 12vh 0 8vh; }
+.eyebrow { color: #ff8e68; font: 12px 'DM Mono', monospace; letter-spacing: .18em; }
+h1 { font-size: clamp(2.8rem, 9vw, 5.4rem); letter-spacing: -.07em; line-height: .9; margin: 20px 0; }
+.intro { max-width: 550px; color: #cac3bb; font-size: 1.1rem; line-height: 1.5; margin-bottom: 36px; }
+form { background: #f7f4ed; color: #171413; border-radius: 18px; padding: 26px; box-shadow: 12px 12px 0 #f26a42; }
+label { display: block; font-weight: 700; margin-bottom: 18px; } label span { font-weight: 400; color: #766d66; }
+input, select { display: block; width: 100%; margin-top: 8px; padding: 12px; border: 1px solid #c9c0b8; border-radius: 8px; font: inherit; background: white; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+button { width: 100%; border: 0; border-radius: 8px; padding: 15px; background: #f26a42; color: white; cursor: pointer; font: 700 1rem 'Space Grotesk', sans-serif; } button:disabled { opacity: .6; cursor: wait; }
+#status { min-height: 1.3em; color: #635b55; font-size: .9rem; margin: 16px 0 0; }
+@media (max-width: 520px) { .shell { padding-top: 8vh; } .grid { grid-template-columns: 1fr; gap: 0; } }
