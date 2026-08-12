@@ -4,7 +4,7 @@ Web app Flask che trasforma una o più foto/video e una canzone in un MP4 vertic
 
 Quando si seleziona una canzone, l'app stima il BPM e suggerisce il numero ideale di foto/clip per la durata e il preset scelti. Anche un solo contenuto è sufficiente: PetCut lo ripete in scene con movimento e variazioni sincronizzate al ritmo.
 
-Il preset **Floating Cutout** estrae automaticamente fotogrammi dal materiale caricato, rimuove lo sfondo del soggetto, li monta su uno sfondo nero con testo e chiude con un reveal del video originale. Per ritagli più puliti, scegli filmati in cui il soggetto si distingue bene dallo sfondo.
+Il preset **Floating Cutout** estrae automaticamente fotogrammi dal materiale caricato, isola il soggetto, li monta su uno sfondo nero con testo e chiude con un reveal del video originale. Per ritagli più puliti, scegli filmati in cui il soggetto è ben illuminato, separato dallo sfondo e vicino al centro dell'inquadratura.
 
 ## Avvio locale
 

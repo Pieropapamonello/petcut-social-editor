@@ -11,9 +11,9 @@ from io import BytesIO
 from pathlib import Path
 
 import numpy as np
+import cv2
 from flask import Flask, abort, jsonify, render_template, request, send_file
 from PIL import Image
-from rembg import new_session, remove
 from werkzeug.utils import secure_filename
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -30,7 +30,6 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 JOBS = {}
 RENDER_QUEUE = ThreadPoolExecutor(max_workers=1)
-REMOVAL_SESSION = None
 
 
 def extension_allowed(filename, allowed):
@@ -110,13 +109,6 @@ def scene_filter(index: int, style: str, bpm: int, duration: float) -> str:
     )
 
 
-def removal_session():
-    global REMOVAL_SESSION
-    if REMOVAL_SESSION is None:
-        REMOVAL_SESSION = new_session("u2netp")
-    return REMOVAL_SESSION
-
-
 def source_frame(path: Path, frame_number: int, frame_count: int) -> Image.Image:
     if path.suffix[1:].lower() in ALLOWED_IMAGE:
         return Image.open(path).convert("RGBA")
@@ -132,12 +124,21 @@ def source_frame(path: Path, frame_number: int, frame_count: int) -> Image.Image
 
 
 def create_cutouts(paths: list[Path], job_dir: Path, count: int) -> list[Path]:
-    """Sample source media and remove the background for the Floating Cutout preset."""
+    """Lightweight foreground extraction for Render Free; subject should be centred."""
     cutouts = []
     for index in range(count):
         source = paths[index % len(paths)]
         frame = source_frame(source, index // len(paths), max(1, math.ceil(count / len(paths))))
-        result = remove(frame, session=removal_session()).convert("RGBA")
+        rgb = np.array(frame.convert("RGB"))
+        height, width = rgb.shape[:2]
+        mask = np.zeros((height, width), np.uint8)
+        inset_x, inset_y = max(2, int(width * 0.06)), max(2, int(height * 0.04))
+        foreground, background = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
+        cv2.grabCut(rgb, mask, (inset_x, inset_y, width - inset_x * 2, height - inset_y * 2), foreground, background, 4, cv2.GC_INIT_WITH_RECT)
+        alpha = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype("uint8")
+        alpha = cv2.morphologyEx(alpha, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        alpha = cv2.GaussianBlur(alpha, (5, 5), 0)
+        result = Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
         bounds = result.getchannel("A").getbbox()
         if bounds:
             result = result.crop(bounds)
