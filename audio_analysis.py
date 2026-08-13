@@ -520,92 +520,60 @@ def analyze_audio(path: Path, requested_duration: float) -> dict:
         return _fallback(fallback_duration)
 
 
-_STYLE_PLANS = {
-    "animal_roulette": {
-        "ideal_min": 6,
-        "ideal_max": 14,
-        "reuse": 3.4,
-        "beats": (2.0, 4.0, 0.5, 1.0),
-        "effects": ("subject hook", "cutout roulette", "impact flash", "full-screen microcuts"),
-    },
-    "mystery_reveal": {
-        "ideal_min": 4,
-        "ideal_max": 10,
-        "reuse": 3.0,
-        "beats": (4.0, 6.0, 1.0, 1.5),
-        "effects": ("teaser", "slow conceal", "reveal", "reaction alternation"),
-    },
-    "kinetic_strips": {
-        "ideal_min": 5,
-        "ideal_max": 12,
-        "reuse": 4.0,
-        "beats": (2.0, 3.0, 0.5, 1.0),
-        "effects": ("type hook", "strip build", "split impact", "kinetic cascade"),
-    },
-    "beat_montage": {
-        "ideal_min": 5,
-        "ideal_max": 14,
-        "reuse": 3.2,
-        "beats": (3.0, 3.0, 1.0, 1.0),
-        "effects": ("visual hook", "beat build", "hard cut", "alternating montage"),
-    },
-}
+REFERENCE_STYLE = "reference_edit"
 
 
 def recommendation(
     style: str, duration: float, rhythm: dict, media_count: int = 0
 ) -> dict:
-    """Turn rhythm analysis into a section-aware editing recommendation."""
-    style = style if style in _STYLE_PLANS else "beat_montage"
-    plan = _STYLE_PLANS[style]
+    """Describe the single four-act edit derived from the supplied reference."""
+    if style != REFERENCE_STYLE:
+        style = REFERENCE_STYLE
     duration = max(1.0, _finite_float(duration, _finite_float(rhythm.get("duration"), 15.0)))
     duration = _quantize_time(duration)
     edit_bpm = min(190.0, max(108.0, _finite_float(rhythm.get("edit_bpm"), 120.0)))
     beat = 60.0 / edit_bpm
     drop = _finite_float(rhythm.get("drop_time"), duration * 0.5)
-    drop = min(max(drop, min(1.0, duration * 0.25)), max(1.0, duration - 0.5))
+    minimum_drop = duration * (0.50 if duration < 8 else 0.40)
+    drop = min(max(drop, minimum_drop), max(minimum_drop, duration - 0.8))
 
-    hook_end = min(drop, max(1.0, min(2.0, drop * 0.30)))
-    impact_end = min(duration, drop + max(beat * 4.0, 1.2))
-    raw_phases = [
-        ("hook", 0.0, hook_end, plan["beats"][0], plan["effects"][0]),
-        ("tension", hook_end, drop, plan["beats"][1], plan["effects"][1]),
-        ("drop", drop, impact_end, plan["beats"][2], plan["effects"][2]),
-        ("climax", impact_end, duration, plan["beats"][3], plan["effects"][3]),
+    # Normalised from Download (5): 3.23 / 8.50 / 11.47 seconds before
+    # the drop, followed by a 12.76-second full-frame climax.
+    intro_end = drop * (3.23 / 11.47)
+    roulette_end = drop * (8.50 / 11.47)
+    phrase_build_end = drop * (9.20 / 11.47)
+    intro_slots = 4 if duration >= 8 else 2
+    slot_frames = max(4, round(intro_end * 30 / intro_slots))
+    cut_frames = slot_frames - max(2, min(slot_frames - 2, round(slot_frames * 0.55)))
+    poses_per_slot = max(1, min(4, round(cut_frames / 3)))
+    intro_cuts = intro_slots * (1 + poses_per_slot)
+    roulette_frames = max(1, round((roulette_end - intro_end) * 30))
+    roulette_cuts = max(8, min(48, round(roulette_frames / 3.35), roulette_frames // 2))
+    phrase_build_cuts = max(2, min(5, round((phrase_build_end - roulette_end) / max(0.14, beat * 0.50))))
+    phrase_cuts = 5
+    impact_cuts = 4 if duration - drop >= 27 / 30 else max(0, int((duration - drop) * 30 // 6))
+    raw_seconds = max(0.0, duration - drop - 23 / 30)
+    climax_cuts = impact_cuts + (max(1, min(60, round(37 * raw_seconds / (24.233 - 12.234)))) if raw_seconds >= 4 / 30 else 0)
+    phases = [
+        {"name": "intro", "start": 0.0, "end": _quantize_time(intro_end, duration), "cuts": intro_cuts, "effect": "clip con nome → cutout nero"},
+        {"name": "roulette", "start": _quantize_time(intro_end, duration), "end": _quantize_time(roulette_end, duration), "cuts": roulette_cuts, "effect": "pose alternate ogni mezzo beat"},
+        {"name": "frase", "start": _quantize_time(roulette_end, duration), "end": _quantize_time(drop, duration), "cuts": phrase_build_cuts + phrase_cuts, "effect": "CAN YOU IMAGINE FLOATING WEIGHTLESS"},
+        {"name": "climax", "start": _quantize_time(drop, duration), "end": duration, "cuts": climax_cuts, "effect": "hard cut, whip, flash e zoom blur"},
     ]
-    phases = []
-    for name, start, end, beats_per_cut, effect in raw_phases:
-        if end - start < 1.0 / FRAME_RATE:
-            continue
-        cuts = max(1, int(math.ceil((end - start) / (beat * beats_per_cut))))
-        phases.append(
-            {
-                "name": name,
-                "start": _quantize_time(start, duration),
-                "end": _quantize_time(end, duration),
-                "beats_per_cut": beats_per_cut,
-                "cuts": cuts,
-                "effect": effect,
-            }
-        )
-    visual_cuts = max(3, sum(phase["cuts"] for phase in phases))
-    ideal_media = int(math.ceil(visual_cuts / plan["reuse"]))
-    ideal_media = max(plan["ideal_min"], min(plan["ideal_max"], ideal_media))
+    visual_cuts = intro_cuts + roulette_cuts + phrase_build_cuts + phrase_cuts + climax_cuts
+    ideal_media = max(8, min(14, int(math.ceil(visual_cuts / 4.2))))
     minimum_media = 1
     media_count = max(0, int(_finite_float(media_count, 0.0)))
 
     if media_count <= 1:
-        note = (
-            "Con un solo contenuto PetCut deve creare crop, cutout e inquadrature diverse; "
-            f"per evitare ripetizioni visibili l'ideale è {ideal_media} foto o clip."
-        )
+        note = f"Funziona anche con un solo contenuto; per replicare la varietà del riferimento sono ideali {ideal_media} foto o clip con pose diverse."
     elif media_count < ideal_media:
         note = (
             f"Il montaggio funziona con {media_count} contenuti, ma {ideal_media} permettono "
             "più varietà nel climax senza ripetere le stesse inquadrature."
         )
     else:
-        note = "Materiale sufficiente: assegna i contenuti diversi ai tagli più forti dopo il drop."
+        note = "Materiale sufficiente per mantenere pose diverse nella roulette e nel climax."
 
     return {
         "ideal_media": ideal_media,

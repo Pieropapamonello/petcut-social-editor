@@ -15,7 +15,7 @@ from typing import Callable, Iterable, Sequence
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 
 WIDTH, HEIGHT, FPS = 576, 1024, 30
@@ -77,18 +77,23 @@ def _save(image: Image.Image, path: Path, quality: int = 94) -> Path:
 
 def _fit_subject(subject: Image.Image, max_width: int, max_height: int) -> Image.Image:
     result = subject.copy()
-    result.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
-    return result
+    if result.width < 1 or result.height < 1:
+        return result
+    scale = min(max_width / result.width, max_height / result.height)
+    size = (max(1, round(result.width * scale)), max(1, round(result.height * scale)))
+    return result.resize(size, Image.Resampling.LANCZOS)
 
 
 def _paste_with_rim(canvas: Image.Image, subject: Image.Image, xy: tuple[int, int], rim: bool = True) -> None:
     subject = subject.convert("RGBA")
     if rim and "A" in subject.getbands():
-        # A one-pixel cool rim is enough to separate dark fur from black.  The
-        # former five-pixel halo made every cutout look grey and artificial.
-        alpha = subject.getchannel("A").filter(ImageFilter.MaxFilter(3)).point(lambda value: int(value * 0.27))
+        # Draw only the one-pixel ring outside the matte. Applying the dilated
+        # alpha itself used to wash the whole subject in a blue-grey halo.
+        alpha = subject.getchannel("A")
+        expanded = alpha.filter(ImageFilter.MaxFilter(3))
+        ring = ImageChops.subtract(expanded, alpha).point(lambda value: int(value * 0.10))
         glow = Image.new("RGBA", subject.size, (226, 235, 246, 0))
-        glow.putalpha(alpha)
+        glow.putalpha(ring)
         canvas.alpha_composite(glow, xy)
     canvas.alpha_composite(subject, xy)
 
@@ -154,7 +159,7 @@ def _is_accent(time_value: float, strong_onsets: Sequence[float], radius: float 
 
 
 def _accent_or_pattern(time_value: float, strong_onsets: Sequence[float], index: int, every: int) -> bool:
-    return _is_accent(time_value, strong_onsets) if strong_onsets else index % every == 0
+    return _is_accent(time_value, strong_onsets) or index % every == 0
 
 
 def _beat(rhythm: dict) -> float:
@@ -178,6 +183,24 @@ def _drop_time(rhythm: dict, duration: float, fallback: float) -> float:
     return _snap(candidate, _onsets(rhythm, duration), 0.18)
 
 
+def _visual_drop_time(rhythm: dict, duration: float, fallback: float) -> float:
+    """Find the first strong impact that starts the reference's drop cluster."""
+    energy_drop = _drop_time(rhythm, duration, fallback)
+    beat = _beat(rhythm)
+    target = energy_drop - 1.5 * beat
+    candidates = []
+    for onset, strength in zip(rhythm.get("onsets", []) or [], rhythm.get("onset_strengths", []) or []):
+        try:
+            onset, strength = round(float(onset) * FPS) / FPS, float(strength)
+        except (TypeError, ValueError):
+            continue
+        if strength >= 0.72 and abs(onset - target) <= 0.16:
+            candidates.append(onset)
+    if candidates:
+        return min(candidates, key=lambda value: abs(value - target))
+    return energy_drop
+
+
 def _frame_boundaries(start: float, end: float, count: int, onsets: Sequence[float], minimum: int = 4) -> list[int]:
     start_frame, end_frame = round(start * FPS), round(end * FPS)
     count = max(1, min(count, max(1, (end_frame - start_frame) // minimum)))
@@ -198,6 +221,55 @@ def _durations(start: float, end: float, count: int, onsets: Sequence[float], mi
     return [(second - first) / FPS for first, second in zip(boundaries, boundaries[1:])]
 
 
+def _weighted_frame_durations(start: float, end: float, weights: Sequence[float], minimum: int = 1) -> list[float]:
+    """Allocate an exact frame span with the largest-remainder method."""
+    span = max(len(weights) * minimum, round(end * FPS) - round(start * FPS))
+    values = np.asarray(weights, dtype=np.float64)
+    values = np.maximum(values, 1e-6)
+    raw = values / values.sum() * span
+    frames = np.maximum(minimum, np.floor(raw).astype(int))
+    while int(frames.sum()) < span:
+        index = int(np.argmax(raw - frames))
+        frames[index] += 1
+    while int(frames.sum()) > span:
+        eligible = np.flatnonzero(frames > minimum)
+        if not len(eligible):
+            break
+        index = int(eligible[np.argmax(frames[eligible] - raw[eligible])])
+        frames[index] -= 1
+    return [int(value) / FPS for value in frames]
+
+
+def _onset_aligned_weighted_durations(
+    start: float,
+    end: float,
+    weights: Sequence[float],
+    onsets: Sequence[float],
+    minimum: int = 4,
+    radius_frames: int = 3,
+) -> list[float]:
+    """Keep a weighted cue sheet while moving inner cuts onto transients."""
+    base = [round(value * FPS) for value in _weighted_frame_durations(start, end, weights, minimum)]
+    start_frame, end_frame = round(start * FPS), round(end * FPS)
+    onset_frames = sorted({round(value * FPS) for value in onsets if start < value < end})
+    boundaries = [start_frame]
+    target = start_frame
+    for index, frame_count in enumerate(base[:-1], start=1):
+        target += frame_count
+        low = boundaries[-1] + minimum
+        high = end_frame - minimum * (len(base) - index)
+        nearby = [frame for frame in onset_frames if low <= frame <= high and abs(frame - target) <= radius_frames]
+        boundaries.append(min(nearby, key=lambda frame: abs(frame - target)) if nearby else max(low, min(high, target)))
+    boundaries.append(end_frame)
+    return [(right - left) / FPS for left, right in zip(boundaries, boundaries[1:])]
+
+
+def _dense_durations(start: float, end: float, target_frames: float = 3.1, maximum: int = 64) -> list[float]:
+    span = max(1, round(end * FPS) - round(start * FPS))
+    count = max(1, min(maximum, round(span / target_frames)))
+    return _weighted_frame_durations(start, end, [1.0] * count, minimum=2)
+
+
 def _section_boundary(rhythm: dict, name: str, duration: float) -> float | None:
     sections = rhythm.get("sections") or []
     for section in sections:
@@ -212,7 +284,7 @@ def _section_boundary(rhythm: dict, name: str, duration: float) -> float | None:
     return None
 
 
-def _sample_video_candidates(path: Path, limit: int = 14) -> list[tuple[float, float]]:
+def _sample_video_candidates(path: Path, limit: int = 24) -> list[tuple[float, float]]:
     """Return diverse, sharp, moving source times without retaining frames."""
     capture = cv2.VideoCapture(str(path))
     length = capture.get(cv2.CAP_PROP_FRAME_COUNT)
@@ -237,16 +309,37 @@ def _sample_video_candidates(path: Path, limit: int = 14) -> list[tuple[float, f
         records.append((score, float(time_value), gray))
         previous = gray
     capture.release()
-    selected: list[tuple[float, float]] = []
-    minimum_gap = max(0.32, seconds / max(8, limit * 2))
-    for score, time_value, _ in sorted(records, reverse=True, key=lambda value: value[0]):
-        if all(abs(time_value - chosen) >= minimum_gap for chosen, _ in selected):
-            selected.append((time_value, score))
-        if len(selected) >= limit:
-            break
+    def difference_hash(gray: np.ndarray) -> np.ndarray:
+        tiny = cv2.resize(gray, (9, 8), interpolation=cv2.INTER_AREA)
+        return (tiny[:, 1:] > tiny[:, :-1]).reshape(-1)
+
+    pool = [(score, time_value, difference_hash(gray)) for score, time_value, gray in records]
+    selected: list[tuple[float, float, np.ndarray]] = []
+    minimum_gap = max(0.18, seconds / max(12, limit * 3))
+    while pool and len(selected) < limit:
+        if not selected:
+            chosen = max(pool, key=lambda value: value[0])
+        else:
+            def diversity(value: tuple[float, float, np.ndarray]) -> float:
+                score, time_value, visual_hash = value
+                visual_distance = min(np.count_nonzero(visual_hash != prior_hash) / 64 for _, _, prior_hash in selected)
+                time_distance = min(abs(time_value - prior_time) / max(1.0, seconds) for _, prior_time, _ in selected)
+                return 0.55 * score + 0.27 * visual_distance + 0.18 * min(1.0, time_distance * 4)
+
+            candidates = [
+                value for value in pool
+                if all(abs(value[1] - prior_time) >= minimum_gap for _, prior_time, _ in selected)
+            ]
+            if not candidates:
+                break
+            chosen = max(candidates, key=diversity)
+        selected.append(chosen)
+        pool.remove(chosen)
     if not selected:
-        selected = [(0.0, 0.0)]
-    return sorted(selected)
+        return [(0.0, 0.0)]
+    # Keep the greedy MMR order: consecutive clips then remain as different
+    # as the source permits instead of returning to chronological similarity.
+    return [(time_value, score) for score, time_value, _ in selected]
 
 
 def _extract_frame(path: Path, time_value: float, destination: Path) -> Path:
@@ -256,13 +349,22 @@ def _extract_frame(path: Path, time_value: float, destination: Path) -> Path:
 
 def _source_assets(paths: Sequence[Path], samples: Sequence[Path] | None, job_dir: Path) -> tuple[list[Path], list[tuple[Path, float]]]:
     images = [Path(value) for value in (samples or []) if Path(value).exists()]
-    video_times: list[tuple[Path, float]] = []
+    video_groups: list[list[tuple[Path, float]]] = []
     for path_value in paths:
         path = Path(path_value)
         if path.suffix.lower() in IMAGE_EXTENSIONS and path.exists():
             images.append(path)
         elif path.suffix.lower() in VIDEO_EXTENSIONS and path.exists():
-            video_times.extend((path, time_value) for time_value, _ in _sample_video_candidates(path))
+            video_groups.append([(path, time_value) for time_value, _ in _sample_video_candidates(path)])
+    # Round-robin different uploads before taking another moment from the
+    # same clip. This makes four supplied animals/people map naturally to the
+    # four reference intro cards and avoids exhausting one source in climax.
+    video_times = [
+        group[index]
+        for index in range(max((len(group) for group in video_groups), default=0))
+        for group in video_groups
+        if index < len(group)
+    ]
     # Samples supplied by the old app are preferred; otherwise create a few
     # reusable full-frame stills from the scored video moments.
     if not images:
@@ -324,12 +426,15 @@ def _cutout_assets(cutouts: Sequence[Path] | None, images: Sequence[Path], job_d
 def _still_clip(image_path: Path, destination: Path, duration: float, mode: str, accent: bool = False, index: int = 0) -> None:
     frames = max(1, round(duration * FPS))
     last = max(1, frames - 1)
+    impact = mode.startswith("impact-")
+    if impact:
+        mode = mode.removeprefix("impact-")
     if mode == "hold":
         # Even the readable holds in the references breathe by a few pixels.
         # Keep it subtle so the subject is stable, but never a frozen JPEG.
         z = f"1.012+0.014*sin(PI*on/{last})"
         x, y = f"iw/2-(iw/zoom/2)+3*sin(2*PI*on/{last})", f"ih/2-(ih/zoom/2)-3*sin(PI*on/{last})"
-    elif mode == "push":
+    elif mode in {"push", "intro-out", "intro-in"}:
         z = f"1+0.10*(on/{last})"
         x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
     elif mode == "pull":
@@ -341,17 +446,45 @@ def _still_clip(image_path: Path, destination: Path, duration: float, mode: str,
     elif mode == "whip-right":
         z = "1.08"
         x, y = f"(iw-iw/zoom)*(1-on/{last})", "ih/2-(ih/zoom/2)"
+    elif mode == "roulette":
+        # The source edit changes pose every few frames, yet each microclip
+        # still carries visible scale/position motion instead of freezing.
+        direction = -1 if index % 2 else 1
+        if index % 3 == 1:
+            z = f"1.115-0.105*(on/{last})"
+        else:
+            z = f"1.010+0.105*(on/{last})"
+        x = f"iw/2-(iw/zoom/2)+{direction}*20*(on/{last})"
+        y = f"ih/2-(ih/zoom/2)-12*(on/{last})"
     else:
         z = f"1+0.05*sin(PI*on/{last})"
         x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+    if mode == "hard":
+        z, x, y = "1.0", "0", "0"
     filters = [f"zoompan=z='{z}':x='{x}':y='{y}':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}"]
     edge = min(0.067, duration * 0.18)
     if mode.startswith("whip"):
         filters.append(
             f"gblur=sigma=8:enable='lt(t,{edge:.3f})+gt(t,{max(0.0, duration - edge):.3f})'"
         )
-    if accent:
-        filters.append("drawbox=color=white@0.48:t=fill:enable='lt(t,0.034)'")
+    if mode == "intro-out":
+        transition = min(0.10, max(1 / FPS, duration * 0.28))
+        filters.append(f"gblur=sigma=7:enable='gt(t,{max(0.0, duration - transition):.3f})'")
+        filters.append(f"fade=t=out:st={max(0.0, duration - transition):.3f}:d={transition:.3f}:color=white")
+    elif mode == "intro-in":
+        transition = min(0.067, max(1 / FPS, duration * 0.24))
+        filters.append(f"fade=t=in:st=0:d={transition:.3f}:color=white")
+    if impact:
+        filters.extend([
+            "drawbox=color=white@0.68:t=fill:enable='eq(n,0)'",
+            "drawbox=color=white@0.34:t=fill:enable='eq(n,1)'",
+            "drawbox=color=white@0.12:t=fill:enable='eq(n,2)'",
+        ])
+    elif accent:
+        filters.extend([
+            "drawbox=color=white@0.56:t=fill:enable='eq(n,0)'",
+            "drawbox=color=white@0.22:t=fill:enable='eq(n,1)'",
+        ])
     _run(["ffmpeg", "-y", "-loop", "1", "-framerate", FPS, "-i", image_path, "-frames:v", frames, "-vf", ",".join(filters), "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-threads", "1", "-pix_fmt", "yuv420p", "-r", FPS, "-g", 15, "-keyint_min", 1, "-sc_threshold", 0, destination])
 
 
@@ -367,31 +500,69 @@ def _video_clip(
     frames = max(1, round(duration * FPS))
     last = max(1, frames - 1)
     direction = -1 if index % 2 else 1
-    source_span = max(duration * 1.45, 0.25)
-    if mode == "whip":
-        timing = f"(0.72*T+0.28*T*T/(2*{source_span:.4f}))/TB"
-    elif mode == "punch":
-        timing = f"(T-0.24*T*T/(2*{source_span:.4f}))/TB"
-    else:
-        timing = "PTS"
-    filters = [f"setpts='{timing}'", f"scale=660:1174:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT}"]
+    timing = "PTS/1.35" if mode == "speed" else "PTS"
+    scale_filter = f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT}"
+    if mode in {"whip", "punch", "pull", "detail", "hflip"}:
+        scale_filter = "scale=620:1102:force_original_aspect_ratio=increase,crop=576:1024"
+    elif mode == "close-left":
+        scale_filter = "scale=720:1280:force_original_aspect_ratio=increase,crop=576:1024:0:(in_h-out_h)/2"
+    elif mode == "close-right":
+        scale_filter = "scale=720:1280:force_original_aspect_ratio=increase,crop=576:1024:in_w-out_w:(in_h-out_h)/2"
+    elif mode == "close-high":
+        scale_filter = "scale=720:1280:force_original_aspect_ratio=increase,crop=576:1024:(in_w-out_w)/2:0"
+    elif mode == "close-low":
+        scale_filter = "scale=720:1280:force_original_aspect_ratio=increase,crop=576:1024:(in_w-out_w)/2:in_h-out_h"
+    filters = [f"setpts='{timing}'", scale_filter]
+    if mode == "hflip":
+        filters.append("hflip")
     exit_start = max(0, last - 4)
-    blur_out = max(0.0, duration - min(0.067, duration * 0.18))
     if mode == "beat":
-        filters.append(f"zoompan=z='1.02+0.06*max(0\\,(on-{exit_start})/4)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
-        filters.append(f"gblur=sigma=7:enable='lt(t,0.067)+gt(t,{max(0.0, duration - 0.067):.3f})'")
+        filters.append(f"zoompan=z='1.00+0.04*max(0\\,(on-{exit_start})/4)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
     elif mode == "whip":
         filters.append(f"zoompan=z='1.02+0.08*(1-min(1\\,on/4))+0.08*max(0\\,(on-{exit_start})/4)':x='iw/2-(iw/zoom/2)+{direction}*34*(1-min(1\\,on/4))-{direction}*34*max(0\\,(on-{exit_start})/4)':y='ih/2-(ih/zoom/2)':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
-        filters.append(f"gblur=sigma=8:enable='lt(t,0.067)+gt(t,{blur_out:.3f})'")
+        filters.append(f"gblur=sigma=7:enable='eq(n,0)+gte(n,{last})'")
     elif mode == "punch":
         filters.append(f"zoompan=z='1.02+0.11*(1-min(1\\,on/5))+0.09*max(0\\,(on-{exit_start})/4)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
-        filters.append(f"gblur=sigma=7:enable='lt(t,0.067)+gt(t,{max(0.0, duration - 0.067):.3f})'")
+        filters.append("gblur=sigma=6:enable='eq(n,0)'")
+    elif mode == "pull":
+        filters.append(f"zoompan=z='1.13-0.11*min(1\\,on/5)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
+    elif mode == "detail":
+        filters.append(f"zoompan=z='1.12+0.03*sin(PI*on/{last})':x='iw/2-(iw/zoom/2)+18*sin(PI*on/{last})':y='ih/2-(ih/zoom/2)-24':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
+    elif mode == "hflip":
+        filters.append(f"zoompan=z='1.02+0.04*max(0\\,(on-{exit_start})/4)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
     else:
         filters.append(f"fps={FPS}")
     filters.extend(["eq=contrast=1.08:saturation=1.18", "unsharp=5:5:0.42"])
     if accent:
-        filters.append("drawbox=color=white@0.50:t=fill:enable='lt(t,0.034)'")
+        filters.extend([
+            "drawbox=color=white@0.58:t=fill:enable='eq(n,0)'",
+            "drawbox=color=white@0.24:t=fill:enable='eq(n,1)'",
+        ])
     _run(["ffmpeg", "-y", "-stream_loop", "-1", "-ss", f"{max(0.0, start):.3f}", "-i", source, "-frames:v", frames, "-vf", ",".join(filters), "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-threads", "1", "-pix_fmt", "yuv420p", "-r", FPS, "-g", 15, "-keyint_min", 1, "-sc_threshold", 0, destination])
+
+
+def _intro_video_clip(
+    source: Path,
+    overlay: Path,
+    destination: Path,
+    start: float,
+    duration: float,
+) -> None:
+    """Render a live raw card with typography over the moving source."""
+    frames = max(1, round(duration * FPS))
+    filters = (
+        f"[0:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
+        f"crop={WIDTH}:{HEIGHT},gblur=sigma=6:enable='lt(n,2)',"
+        f"fade=t=in:st=0:d={2 / FPS:.4f}:color=white,fps={FPS}[base];"
+        "[base][1:v]overlay=0:0:format=auto,format=yuv420p[out]"
+    )
+    _run([
+        "ffmpeg", "-y", "-v", "error", "-stream_loop", "-1", "-ss", f"{max(0.0, start):.3f}", "-i", source,
+        "-loop", "1", "-framerate", FPS, "-i", overlay, "-frames:v", frames,
+        "-filter_complex", filters, "-map", "[out]", "-an", "-c:v", "libx264",
+        "-preset", "ultrafast", "-crf", "22", "-threads", "1", "-pix_fmt", "yuv420p",
+        "-r", FPS, "-g", 15, "-keyint_min", 1, "-sc_threshold", 0, destination,
+    ])
 
 
 def _finish(clips: Sequence[Path], audio_path: Path, destination: Path, duration: float, job_dir: Path) -> None:
@@ -424,18 +595,54 @@ class _Timeline:
         _video_clip(source, target, start, clip_duration, mode, accent, len(self.clips))
         self.clips.append(target)
 
+    def add_intro_video(self, source: Path, overlay: Path, start: float, clip_duration: float) -> None:
+        target = self.path()
+        _intro_video_clip(source, overlay, target, start, clip_duration)
+        self.clips.append(target)
+
     def finish(self) -> None:
         _notify(self.progress, "finalizzazione", 94)
         _finish(self.clips, self.audio_path, self.destination, self.duration, self.job_dir)
 
 
-def _raw_board(source: Path, label: str, destination: Path, darken: float = 0.0) -> Path:
+def _raw_board(
+    source: Path,
+    label: str,
+    destination: Path,
+    darken: float = 0.0,
+) -> Path:
     canvas = _cover(Image.open(source)).convert("RGBA")
     if darken:
         overlay = Image.new("RGBA", canvas.size, (0, 0, 0, int(255 * darken)))
         canvas.alpha_composite(overlay)
     draw = ImageDraw.Draw(canvas)
-    _center_text(draw, label.upper(), int(HEIGHT * 0.50), start_size=86, stroke=0)
+    # Keep the name fully readable on top of the live/raw card. The source
+    # already contains the animal, so compositing a second subject here would
+    # duplicate it and hide nearly the whole word.
+    intro_text = label.upper()
+    intro_font = _text_fit(draw, intro_text, WIDTH - 20, 170)
+    natural_width = float(draw.textlength(intro_text, font=intro_font))
+    target_width = min(WIDTH - 20, max(WIDTH * 0.72, natural_width))
+    spacing = max(0.0, (target_width - natural_width) / max(1, len(intro_text) - 1))
+    cursor = (WIDTH - target_width) / 2
+    for character in intro_text:
+        draw.text((cursor, int(HEIGHT * 0.50)), character, font=intro_font, fill="white", stroke_width=2, stroke_fill="black")
+        cursor += float(draw.textlength(character, font=intro_font)) + spacing
+    return _save(canvas, destination)
+
+
+def _intro_text_overlay(label: str, destination: Path) -> Path:
+    canvas = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+    text = label.upper()
+    font = _text_fit(draw, text, WIDTH - 20, 170)
+    natural_width = float(draw.textlength(text, font=font))
+    target_width = min(WIDTH - 20, max(WIDTH * 0.72, natural_width))
+    spacing = max(0.0, (target_width - natural_width) / max(1, len(text) - 1))
+    cursor = (WIDTH - target_width) / 2
+    for character in text:
+        draw.text((cursor, int(HEIGHT * 0.50)), character, font=font, fill="white", stroke_width=2, stroke_fill="black")
+        cursor += float(draw.textlength(character, font=font)) + spacing
     return _save(canvas, destination)
 
 
@@ -457,15 +664,15 @@ def _cutout_board(subject_path: Path, destination: Path, index: int, label: str 
     return _save(canvas, destination)
 
 
-def _collage_board(subject_paths: Sequence[Path], destination: Path, word: str, count: int) -> Path:
+def _collage_board(subject_paths: Sequence[Path], destination: Path, word: str, count: int, layout_seed: int = 0) -> Path:
     """Place text first, then subjects, creating the reference's text-behind z-order."""
     canvas = Image.new("RGBA", (WIDTH, HEIGHT), "black")
     draw = ImageDraw.Draw(canvas)
     # Safe central band: y 435..590.  Subjects occupy top and bottom lanes.
-    _center_text(draw, word.upper(), 452, max_width=WIDTH - 24, start_size=104)
+    _center_text(draw, word.upper(), 495, max_width=WIDTH - 24, start_size=104)
     positions = [(22, 72), (302, 92), (4, 650), (308, 660), (172, 36), (170, 704)]
     for index in range(max(1, count)):
-        subject = _fit_subject(_open_rgba(subject_paths[(index * 3 + count) % len(subject_paths)]), 265, 330)
+        subject = _fit_subject(_open_rgba(subject_paths[(index * 3 + layout_seed) % len(subject_paths)]), 265, 330)
         if index % 3 == 1:
             subject = ImageOps.mirror(subject)
         x, y = positions[index % len(positions)]
@@ -473,17 +680,31 @@ def _collage_board(subject_paths: Sequence[Path], destination: Path, word: str, 
     return _save(canvas, destination)
 
 
-def _render_animal_roulette(
+def _intro_labels(title: str) -> list[str]:
+    values = [value.strip().upper() for value in title.replace("|", ",").replace("/", ",").split(",") if value.strip()]
+    if len(values) >= 2:
+        return [values[index % len(values)] for index in range(4)]
+    if values:
+        return [values[0], "WATCH", "IMAGINE", "FLOATING"]
+    return ["ANIMAL", "WATCH", "IMAGINE", "FLOATING"]
+
+
+def _render_reference_edit(
     paths: Sequence[Path], images: list[Path], video_times: list[tuple[Path, float]], cutouts: list[Path], audio: Path,
     job_dir: Path, destination: Path, duration: float, rhythm: dict, title: str, progress: Progress | None,
 ) -> dict:
     onsets, strong, beat = _onsets(rhythm, duration), _strong_onsets(rhythm, duration), _beat(rhythm)
     fallback_drop = duration * (11.47 / 24.23)
-    drop = _drop_time(rhythm, duration, fallback_drop)
+    drop = _visual_drop_time(rhythm, duration, fallback_drop)
+    # Very early analyzer candidates cannot contain the measured intro,
+    # roulette and five-word cue sheet. Keep short edits frame-safe instead
+    # of over-allocating those sections and truncating the final climax.
+    minimum_drop = duration * (0.50 if duration < 8 else 0.40)
+    drop = round(max(minimum_drop, min(duration - 0.8, drop)) * FPS) / FPS
     intro_end = _snap(drop * (3.23 / 11.47), onsets, 0.14)
     roulette_end = _snap(drop * (8.50 / 11.47), onsets, 0.14)
     timeline = _Timeline(job_dir, audio, destination, duration, progress)
-    labels = [title.upper(), "WATCH", "IMAGINE", "FLOATING"] if title.strip() else ["ANIMAL", "WATCH", "IMAGINE", "FLOATING"]
+    labels = _intro_labels(title)
 
     # Act 1: each subject gets raw context followed by a cutout pose.
     _notify(progress, "intro", 8)
@@ -491,54 +712,126 @@ def _render_animal_roulette(
     slot_durations = _durations(0, intro_end, intro_slots, onsets, 8)
     for index, slot_duration in enumerate(slot_durations):
         slot_frames = max(4, round(slot_duration * FPS))
-        raw_frames = max(2, min(slot_frames - 2, round(slot_frames * 0.62)))
+        raw_frames = max(2, min(slot_frames - 2, round(slot_frames * 0.55)))
         raw_duration, cut_duration = raw_frames / FPS, (slot_frames - raw_frames) / FPS
         source_image = images[index % len(images)]
         label = labels[index % len(labels)]
-        board = _raw_board(source_image, label, job_dir / f"animal-intro-raw-{index:02d}.jpg", 0.06)
         intro_time = sum(slot_durations[:index])
-        timeline.add_still(board, raw_duration, "pull" if index % 2 else "push", accent=index > 0 and _accent_or_pattern(intro_time, strong, index, 1))
-        board = _cutout_board(cutouts[index % len(cutouts)], job_dir / f"animal-intro-cut-{index:02d}.png", index)
-        timeline.add_still(board, cut_duration, "hold")
+        original_source = Path(paths[index % len(paths)])
+        slot_video_times = [value for value in video_times if value[0] == original_source]
+        if original_source.suffix.lower() in VIDEO_EXTENSIONS and slot_video_times:
+            source_video, source_time = slot_video_times[(index // max(1, len(paths))) % len(slot_video_times)]
+            overlay = _intro_text_overlay(label, job_dir / f"reference-intro-text-{index:02d}.png")
+            timeline.add_intro_video(source_video, overlay, source_time, raw_duration)
+        else:
+            board = _raw_board(
+                source_image,
+                label,
+                job_dir / f"reference-intro-raw-{index:02d}.jpg",
+                darken=0.04,
+            )
+            timeline.add_still(board, raw_duration, "intro-in", accent=False)
 
-    # Act 2: reference cadence is a half-beat roulette, capped at 28.
+        # The reference fires several 3-frame poses after every raw card.
+        pose_count = max(1, min(4, round((slot_frames - raw_frames) / 3)))
+        pose_durations = _weighted_frame_durations(0, cut_duration, [1] * pose_count, minimum=2)
+        for pose_index, pose_duration in enumerate(pose_durations):
+            cutout_index = (index * 3 + pose_index) % len(cutouts)
+            board = _cutout_board(
+                cutouts[cutout_index],
+                job_dir / f"reference-intro-cut-{index:02d}-{pose_index:02d}.png",
+                index * 3 + pose_index,
+            )
+            timeline.add_still(
+                board,
+                pose_duration,
+                "roulette",
+                accent=pose_index == 0 and index > 0 and _accent_or_pattern(intro_time, strong, index, 1),
+            )
+
+    # Act 2: the measured reference cadence is mostly three frames per pose,
+    # with a hard cap of 48 poses for a 24-second edit.
     _notify(progress, "roulette", 28)
-    roulette_count = min(30, max(8, round((roulette_end - intro_end) / max(0.13, beat * 0.44))))
-    roulette_durations = _durations(intro_end, roulette_end, roulette_count, onsets, 3)
-    modes = ("hold", "hold", "push", "hold", "pull", "hold")
+    roulette_durations = _dense_durations(intro_end, roulette_end, 3.35, maximum=48)
     for index, clip_duration in enumerate(roulette_durations):
-        board = _cutout_board(cutouts[(index * 7 + index // max(1, len(cutouts))) % len(cutouts)], job_dir / f"animal-roulette-{index:02d}.png", index + 1)
+        board = _cutout_board(cutouts[(index * 7 + index // max(1, len(cutouts))) % len(cutouts)], job_dir / f"reference-roulette-{index:02d}.png", index + 1)
         cut_time = intro_end + sum(roulette_durations[:index])
-        timeline.add_still(board, clip_duration, modes[index % len(modes)], accent=index == 0 or _accent_or_pattern(cut_time, strong, index, 6))
+        timeline.add_still(board, clip_duration, "roulette", accent=index == 0)
 
-    # Act 3: exactly five progressive words in the central safe area.
+    # Act 3: subjects first accumulate around an empty centre, then the five
+    # words use the measured unequal holds from the reference.
     _notify(progress, "collage", 48)
+    phrase_start = _snap(drop * (9.20 / 11.47), onsets, 0.12)
+    phrase_start = max(roulette_end + 4 / FPS, min(drop - 15 / FPS, phrase_start))
+    build_count = max(2, min(5, round((phrase_start - roulette_end) / max(0.14, beat * 0.50))))
+    build_durations = _durations(roulette_end, phrase_start, build_count, onsets, 4)
+    for index, clip_duration in enumerate(build_durations):
+        board = _collage_board(
+            cutouts,
+            job_dir / f"reference-collage-build-{index:02d}.png",
+            "",
+            index + 2,
+            0,
+        )
+        timeline.add_still(board, clip_duration, "pulse", accent=index == 0)
+
     words = ["CAN", "YOU", "IMAGINE", "FLOATING", "WEIGHTLESS"]
-    collage_durations = _durations(roulette_end, drop, 5, onsets, 6)
+    collage_durations = _weighted_frame_durations(phrase_start, drop, [7, 7, 22, 13, 19], minimum=3)
     for index, clip_duration in enumerate(collage_durations):
-        board = _collage_board(cutouts, job_dir / f"animal-collage-{index:02d}.png", words[index], min(len(cutouts), index + 2))
-        cut_time = roulette_end + sum(collage_durations[:index])
-        timeline.add_still(board, clip_duration, "pulse", accent=index == 0 or _accent_or_pattern(cut_time, strong, index, 5))
+        board = _collage_board(cutouts, job_dir / f"reference-collage-{index:02d}.png", words[index], 4, 0)
+        cut_time = phrase_start + sum(collage_durations[:index])
+        timeline.add_still(board, clip_duration, "pulse", accent=False)
 
     # Act 4: alternate beat and half-beat source clips. Scored moments avoid
     # dead/off-focus footage; accents are short and sparse.
     _notify(progress, "climax", 62)
     remaining = duration - drop
-    climax_count = max(4, min(48, round(remaining / max(0.13, beat * 0.70))))
-    climax_durations = _durations(drop, duration, climax_count, onsets, 4)
+    climax_pattern = [6, 6, 5, 6, 11, 12, 7, 4, 6, 5, 11, 17, 10, 7, 11, 12, 23, 5, 7, 4, 6, 16, 4, 13, 11, 6, 12, 5, 11, 17, 11, 6, 11, 12, 11, 6, 5, 11, 15, 6, 13]
+    impact_frames = [6, 6, 5, 6]
+    available_frames = max(0, round(remaining * FPS))
+    while impact_frames and sum(impact_frames) > max(0, available_frames - 4):
+        impact_frames.pop()
+    impact_durations = [frames / FPS for frames in impact_frames]
+    raw_start = drop + sum(impact_durations)
+    raw_remaining = max(0.0, duration - raw_start)
+    raw_target_count = max(1, min(60, round(37 * raw_remaining / (24.233 - 12.234)))) if raw_remaining >= 4 / FPS else 0
+    raw_weights = [climax_pattern[(index + 4) % len(climax_pattern)] for index in range(raw_target_count)]
+    raw_durations = (
+        _onset_aligned_weighted_durations(raw_start, duration, raw_weights, onsets, minimum=4, radius_frames=3)
+        if raw_weights else []
+    )
+    for index, clip_duration in enumerate(impact_durations):
+        board = _collage_board(
+            cutouts,
+            job_dir / f"reference-drop-impact-{index:02d}.png",
+            "",
+            min(6, 4 + index),
+            index,
+        )
+        timeline.add_still(
+            board,
+            clip_duration,
+            "impact-" + ("push", "whip-left", "whip-right", "pull")[index],
+            accent=True,
+        )
     if video_times:
-        for index, clip_duration in enumerate(climax_durations):
-            source, source_time = video_times[(index * 7) % len(video_times)]
-            mode = ("punch", "whip", "beat", "whip")[index % 4]
-            cut_time = drop + sum(climax_durations[:index])
-            timeline.add_video(source, max(0, source_time - clip_duration * 0.35), clip_duration, mode, accent=index == 0 or _accent_or_pattern(cut_time, strong, index, 6))
-            _notify(progress, "climax", 62 + round(28 * (index + 1) / len(climax_durations)))
+        for index, clip_duration in enumerate(raw_durations):
+            source, source_time = video_times[index % len(video_times)]
+            modes = (
+                "punch", "close-left", "speed", "whip", "close-right", "beat",
+                "hflip", "close-high", "pull", "detail", "close-low", "beat",
+            )
+            mode = modes[index % len(modes)]
+            cut_time = raw_start + sum(raw_durations[:index])
+            timeline.add_video(source, max(0, source_time - clip_duration * 0.20), clip_duration, mode, accent=_accent_or_pattern(cut_time, strong, index, 5))
+            _notify(progress, "climax", 62 + round(28 * (index + 1) / max(1, len(raw_durations))))
     else:
-        for index, clip_duration in enumerate(climax_durations):
-            cut_time = drop + sum(climax_durations[:index])
-            timeline.add_still(images[index % len(images)], clip_duration, modes[index % 4], accent=index == 0 or _accent_or_pattern(cut_time, strong, index, 6))
+        for index, clip_duration in enumerate(raw_durations):
+            cut_time = raw_start + sum(raw_durations[:index])
+            photo_modes = ("push", "whip-left", "pull", "whip-right", "pulse")
+            timeline.add_still(images[index % len(images)], clip_duration, photo_modes[index % len(photo_modes)], accent=_accent_or_pattern(cut_time, strong, index, 5))
     timeline.finish()
-    return {"scenes": len(timeline.clips), "drop_time": drop, "preset": "animal_roulette"}
+    return {"scenes": len(timeline.clips), "drop_time": drop, "mode": "reference_edit"}
 
 
 def _silhouette_board(subject_path: Path, destination: Path, progress_value: float, questions: int = 0, reveal: float = 0.0) -> Path:
@@ -762,7 +1055,7 @@ def render_preset(
     function can be called from Flask workers, tests, or a future queue worker.
     """
     style = str(style).strip().lower()
-    supported = {"animal_roulette", "mystery_reveal", "kinetic_strips", "beat_montage"}
+    supported = {"reference_edit"}
     if style not in supported:
         raise ValueError(f"Unknown preset {style!r}; expected one of {sorted(supported)}")
     paths = [Path(path) for path in paths]
@@ -781,12 +1074,7 @@ def render_preset(
         for index, (source, source_time) in enumerate(video_times[:4]):
             images.append(_extract_frame(source, source_time, job_dir / f"engine-fallback-{index:02d}.jpg"))
     subjects = _cutout_assets(cutouts, images, job_dir)
-    renderer = {
-        "animal_roulette": _render_animal_roulette,
-        "mystery_reveal": _render_mystery_reveal,
-        "kinetic_strips": _render_kinetic_strips,
-        "beat_montage": _render_beat_montage,
-    }[style]
+    renderer = _render_reference_edit
     result = renderer(paths, images, video_times, subjects, audio_path, job_dir, destination, duration, rhythm, title, progress)
     _notify(progress, "completato", 100)
     return result

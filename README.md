@@ -4,14 +4,16 @@ PetCut trasforma foto o video e una canzone in un montaggio verticale 9:16, espo
 
 Il motore non applica un effetto casuale in modo uniforme: analizza BPM, transienti, intensità e punto di drop, poi costruisce una timeline diversa per ogni sezione del brano. I tagli sono quantizzati sui frame e agganciati agli onset più vicini. Anche un solo contenuto può essere riutilizzato con inquadrature, pose, crop e movimenti differenti.
 
-## Preset
+## Montaggio unico
 
-- **Animal Roulette** — quattro atti: etichette, roulette di cutout, frase cinetica e climax full-frame.
-- **Mystery Reveal** — silhouette frammentata, `? / ?? / ???`, rivelazione al drop e montaggio finale.
-- **Kinetic Strips** — titolo condensato dietro al soggetto, pannelli diagonali, card, maschere V/X e strisce.
-- **Beat Montage** — montaggio più semplice con clip leggibili, punch/whip brevi e cambi ogni due beat.
+PetCut produce un solo stile, ricostruito sul riferimento fornito:
 
-Per i preset con livelli, il soggetto viene individuato localmente con un modello ONNX incluso nel repository. Non vengono inviati file a servizi AI esterni. Le informazioni sul modello sono in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+1. clip introduttive in movimento con nomi grandi;
+2. roulette di pose scontornate su nero;
+3. collage con la frase `CAN YOU IMAGINE FLOATING WEIGHTLESS`;
+4. climax full-frame con hard cut, whip, flash e zoom blur sul drop.
+
+Per creare i livelli, il soggetto viene individuato localmente con un modello ONNX incluso nel repository. Non vengono inviati file a servizi AI esterni. Le informazioni sul modello sono in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Avvio locale
 

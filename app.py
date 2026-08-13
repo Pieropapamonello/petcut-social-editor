@@ -33,8 +33,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 ALLOWED_VIDEO = {"mp4", "mov", "m4v", "webm"}
 ALLOWED_IMAGE = {"jpg", "jpeg", "png", "webp"}
 ALLOWED_AUDIO = {"mp3", "wav", "m4a", "aac", "ogg"}
-SUPPORTED_STYLES = {"animal_roulette", "mystery_reveal", "kinetic_strips", "beat_montage"}
-CUTOUT_STYLES = {"animal_roulette", "mystery_reveal", "kinetic_strips"}
+REFERENCE_STYLE = "reference_edit"
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "200"))
 # The visual reference itself is 576x1024. Matching it also keeps peak memory
 # safely below Render Free's limit while retaining a crisp 9:16 social export.
@@ -207,7 +206,7 @@ def scene_filter(index: int, style: str, bpm: int, duration: float) -> str:
 
 def source_frame(path: Path, frame_number: int, frame_count: int) -> Image.Image:
     if path.suffix[1:].lower() in ALLOWED_IMAGE:
-        frame = Image.open(path).convert("RGBA")
+        frame = ImageOps.exif_transpose(Image.open(path)).convert("RGBA")
         frame.thumbnail((720, 1280), Image.Resampling.LANCZOS)
         return frame
     length = media_duration(path)
@@ -473,13 +472,25 @@ def detect_subject(rgb: np.ndarray) -> tuple[int, int, int, int]:
 
 
 def release_subject_detector():
-    global SUBJECT_NET, FOREGROUND_NET, INSTANCE_NET
+    global SUBJECT_NET, FOREGROUND_NET, INSTANCE_NET, INSTANCE_NET_FAILED
     with SUBJECT_NET_LOCK:
         SUBJECT_NET = None
     with FOREGROUND_NET_LOCK:
         FOREGROUND_NET = None
     with INSTANCE_NET_LOCK:
         INSTANCE_NET = None
+        # A miss disables the heavier model only for the current job. Allow
+        # the next upload to try it again after all native buffers are freed.
+        INSTANCE_NET_FAILED = False
+    gc.collect()
+
+
+def release_instance_after_miss():
+    """Free ONNX buffers before loading the lightweight fallback networks."""
+    global INSTANCE_NET, INSTANCE_NET_FAILED
+    with INSTANCE_NET_LOCK:
+        INSTANCE_NET = None
+        INSTANCE_NET_FAILED = True
     gc.collect()
 
 
@@ -488,7 +499,22 @@ def isolate_subject(frame: Image.Image, motion: np.ndarray | None = None, stabil
     rgb = np.array(frame.convert("RGB"))
     height, width = rgb.shape[:2]
     instance_probability, instance_box = instance_subject_mask(rgb)
-    x, y, box_width, box_height = instance_box or subject_box or detect_subject(rgb)
+    if instance_probability is None:
+        # Avoid retaining YOLOv8's native inference workspace while U2NetP
+        # and GrabCut are active; this is important on 512 MB Render workers.
+        release_instance_after_miss()
+        # Do not stack two more neural networks after an instance miss. The
+        # conservative centre box below feeds the existing colour-aware
+        # GrabCut fallback and stays well within Render Free's memory limit.
+        fallback_box = (
+            int(width * 0.12),
+            int(height * 0.08),
+            int(width * 0.76),
+            int(height * 0.86),
+        )
+        x, y, box_width, box_height = subject_box or fallback_box
+    else:
+        x, y, box_width, box_height = instance_box or subject_box or detect_subject(rgb)
     x, y = max(0, x), max(0, y)
     box_width = max(2, min(width - x, box_width))
     box_height = max(2, min(height - y, box_height))
@@ -504,7 +530,7 @@ def isolate_subject(frame: Image.Image, motion: np.ndarray | None = None, stabil
     face_zone = ((xx - center_x) / max(2, box_width * 0.23)) ** 2 + ((yy - (y + box_height * 0.30)) / max(2, box_height * 0.23)) ** 2 < 1
     protected_zone = ((xx - center_x) / max(2, box_width * 0.38)) ** 2 + ((yy - center_y) / max(2, box_height * 0.54)) ** 2 < 1
     border = (xx < width * 0.035) | (xx > width * 0.965) | (yy < height * 0.025) | (yy > height * 0.975)
-    saliency = instance_probability if instance_probability is not None else neural_saliency(rgb)
+    saliency = instance_probability
 
     if instance_probability is not None:
         # Instance masks are much cleaner around rugs, furniture and floors
@@ -524,8 +550,13 @@ def isolate_subject(frame: Image.Image, motion: np.ndarray | None = None, stabil
         alpha = cv2.GaussianBlur(alpha, (3, 3), 0)
         foreground_pixels = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)[alpha > 127]
         if foreground_pixels.size and float(np.median(foreground_pixels)) < 85:
-            gamma = 0.52 if float(np.median(foreground_pixels)) < 55 else 0.76
-            enhanced = np.clip(np.power(rgb.astype(np.float32) / 255, gamma) * 244 + 11, 0, 255).astype(np.uint8)
+            # A strong gamma curve made dark fur grey and amplified coloured
+            # edge contamination.  A small linear shadow lift keeps the
+            # source texture and colour intact while remaining readable on
+            # the black reference background.
+            median_luma = float(np.median(foreground_pixels))
+            gain, lift = ((1.14, 10.0) if median_luma < 55 else (1.07, 6.0))
+            enhanced = np.clip(rgb.astype(np.float32) * gain + lift, 0, 255).astype(np.uint8)
             rgb = np.where((alpha > 0)[:, :, None], enhanced, rgb)
         return Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
 
@@ -603,8 +634,9 @@ def isolate_subject(frame: Image.Image, motion: np.ndarray | None = None, stabil
 
     foreground_pixels = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)[alpha > 127]
     if foreground_pixels.size and float(np.median(foreground_pixels)) < 85:
-        gamma = 0.58 if float(np.median(foreground_pixels)) < 55 else 0.82
-        enhanced = np.clip(np.power(rgb.astype(np.float32) / 255, gamma) * 241 + 10, 0, 255).astype(np.uint8)
+        median_luma = float(np.median(foreground_pixels))
+        gain, lift = ((1.14, 10.0) if median_luma < 55 else (1.07, 6.0))
+        enhanced = np.clip(rgb.astype(np.float32) * gain + lift, 0, 255).astype(np.uint8)
         rgb = np.where((alpha > 0)[:, :, None], enhanced, rgb)
     return Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
 
@@ -864,25 +896,22 @@ def health():
         ffmpeg=shutil.which("ffmpeg") is not None,
         output=f"{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}",
         fps=30,
-        presets=sorted(SUPPORTED_STYLES),
-        profile="section-aware-v2",
+        mode=REFERENCE_STYLE,
+        profile="reference-match-v4",
     )
 
 
 @app.post("/api/analyze-audio")
 def analyze_audio():
     audio = request.files.get("audio")
-    style = request.form.get("style", "animal_roulette")
     requested_seconds = requested_duration()
     if not audio or not extension_allowed(audio.filename, ALLOWED_AUDIO):
         abort(400, "Carica una canzone in formato MP3, WAV, M4A, AAC o OGG.")
-    if style not in SUPPORTED_STYLES:
-        abort(400, "Preset non supportato.")
     with tempfile.TemporaryDirectory(prefix="petcut-analysis-") as temp:
         path = Path(temp) / f"audio.{secure_filename(audio.filename).rsplit('.', 1)[1]}"
         audio.save(path)
         rhythm = analyze_audio_structure(path, requested_seconds)
-    plan = audio_recommendation(style, rhythm["duration"], rhythm)
+    plan = audio_recommendation(REFERENCE_STYLE, rhythm["duration"], rhythm)
     return jsonify(
         bpm=rhythm["bpm"],
         edit_bpm=rhythm["edit_bpm"],
@@ -897,23 +926,25 @@ def analyze_audio():
     )
 
 
-def render_job(job_id, paths, audio_path, style, title, requested_seconds, job_dir):
+def render_job(job_id, paths, audio_path, title, requested_seconds, job_dir):
     try:
         JOBS[job_id].update(progress=3, stage=0, phase="Analisi del ritmo e delle sezioni musicali")
         rhythm = analyze_audio_structure(audio_path, float(requested_seconds))
         duration = min(float(requested_seconds), float(rhythm["duration"]))
         JOBS[job_id].update(progress=10, stage=1, phase="Selezione delle inquadrature migliori")
 
-        cutouts, samples = None, None
-        if style in CUTOUT_STYLES:
-            # Temporal pose variety prevents the repeated static silhouette that
-            # made the previous renderer look procedural and visibly cheaper.
-            cutout_count = max(8, min(12, len(paths) * 3))
-            try:
-                cutouts, samples = create_cutouts(paths, job_dir, cutout_count)
-            finally:
-                release_subject_detector()
-            JOBS[job_id].update(progress=26, stage=2, phase="Soggetti scontornati e livelli pronti")
+        # The only edit uses layered subjects throughout its first three acts.
+        # Twelve temporal samples preserve pose variety even with one source.
+        has_video = any(Path(path).suffix.lower().lstrip(".") in ALLOWED_VIDEO for path in paths)
+        # A still image yields the same matte on every pass; reuse it through
+        # transforms in the renderer instead of running segmentation eight
+        # times. Videos still supply twelve genuinely different poses.
+        cutout_count = 12 if has_video else max(1, min(12, len(paths)))
+        try:
+            cutouts, samples = create_cutouts(paths, job_dir, cutout_count)
+        finally:
+            release_subject_detector()
+        JOBS[job_id].update(progress=26, stage=2, phase="Soggetti scontornati e livelli pronti")
 
         destination = job_dir / "petcut-social-edit.mp4"
 
@@ -923,7 +954,7 @@ def render_job(job_id, paths, audio_path, style, title, requested_seconds, job_d
             JOBS[job_id].update(progress=value, stage=stage, phase=phase.capitalize())
 
         metadata = render_preset(
-            style,
+            REFERENCE_STYLE,
             paths,
             audio_path,
             job_dir,
@@ -944,7 +975,7 @@ def render_job(job_id, paths, audio_path, style, title, requested_seconds, job_d
             bpm=rhythm["bpm"],
             edit_bpm=rhythm["edit_bpm"],
             drop_time=metadata.get("drop_time", rhythm["drop_time"]),
-            preset=style,
+            mode=REFERENCE_STYLE,
             scenes=metadata["scenes"],
         )
         (job_dir / "job.json").write_text(
@@ -963,13 +994,12 @@ def render_job(job_id, paths, audio_path, style, title, requested_seconds, job_d
 @app.post("/api/render")
 def render_video():
     media, audio = [file for file in request.files.getlist("media") if file and file.filename], request.files.get("audio")
-    style = request.form.get("style", "animal_roulette")
-    title = request.form.get("title", "").strip()[:32]
+    title = request.form.get("title", "").strip()[:64]
     requested_seconds = requested_duration()
     if not media or not audio:
         abort(400, "Carica almeno una foto o un video e una canzone.")
-    if style not in SUPPORTED_STYLES or any(not extension_allowed(file.filename, ALLOWED_VIDEO | ALLOWED_IMAGE) for file in media) or not extension_allowed(audio.filename, ALLOWED_AUDIO):
-        abort(400, "Formato o preset non supportato.")
+    if any(not extension_allowed(file.filename, ALLOWED_VIDEO | ALLOWED_IMAGE) for file in media) or not extension_allowed(audio.filename, ALLOWED_AUDIO):
+        abort(400, "Formato non supportato.")
     if len(media) > 30:
         abort(400, "Puoi caricare al massimo 30 foto o video per montaggio.")
     job_id, job_dir = uuid.uuid4().hex, OUTPUT_DIR / "jobs" / uuid.uuid4().hex
@@ -982,7 +1012,7 @@ def render_video():
         file.save(path)
         paths.append(path)
     JOBS[job_id] = {"status": "processing", "progress": 1, "stage": 0, "phase": "File ricevuti"}
-    RENDER_QUEUE.submit(render_job, job_id, paths, audio_path, style, title, requested_seconds, job_dir)
+    RENDER_QUEUE.submit(render_job, job_id, paths, audio_path, title, requested_seconds, job_dir)
     return jsonify(job_id=job_id), 202
 
 

@@ -9,13 +9,13 @@ const formError = document.querySelector('#form-error');
 
 const analysisPanel = document.querySelector('#song-analysis');
 const analysisEmpty = analysisPanel.querySelector('.analysis-empty');
+const analysisMessage = document.querySelector('#analysis-message');
 const analysisResult = analysisPanel.querySelector('.analysis-result');
 const analysisNote = document.querySelector('#analysis-note');
 const musicBpm = document.querySelector('#music-bpm');
 const editBpm = document.querySelector('#edit-bpm');
 const contentCount = document.querySelector('#content-count');
 const visualCuts = document.querySelector('#visual-cuts');
-const presetPhaseList = document.querySelector('#preset-phase-list');
 
 const renderPanel = document.querySelector('#render-panel');
 const renderHeading = document.querySelector('#render-heading');
@@ -31,19 +31,8 @@ const resultVideo = document.querySelector('#result-video');
 const downloadButton = document.querySelector('#download-button');
 const newEditButton = document.querySelector('#new-edit-button');
 
-const presetPhases = {
-  animal_roulette: ['Etichette', 'Roulette cutout', 'Frase cinetica', 'Climax'],
-  mystery_reveal: ['Silhouette', 'Indizi', 'Attesa', 'Rivelazione'],
-  kinetic_strips: ['Titolo', 'Pannelli', 'Slice', 'Accelerazione'],
-  beat_montage: ['Intro', 'Tagli sul beat', 'Build-up', 'Drop finale'],
-};
-
 let analysisRequest;
 let pollTimer;
-
-function selectedStyle() {
-  return form.querySelector('input[name="style"]:checked').value;
-}
 
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 MB';
@@ -65,15 +54,6 @@ function summarizeFiles(input, target, singular, plural) {
   target.textContent = `${files.length} ${label} · ${formatBytes(totalSize)} · ${names}${remaining}`;
 }
 
-function updatePresetPhases() {
-  presetPhaseList.replaceChildren();
-  presetPhases[selectedStyle()].forEach((phase) => {
-    const item = document.createElement('li');
-    item.textContent = phase;
-    presetPhaseList.append(item);
-  });
-}
-
 async function responseError(response, fallback) {
   const contentType = response.headers.get('content-type') || '';
   if (contentType.includes('application/json')) {
@@ -89,7 +69,7 @@ async function responseError(response, fallback) {
 function showAnalysisLoading() {
   analysisPanel.setAttribute('aria-busy', 'true');
   analysisEmpty.hidden = false;
-  analysisEmpty.lastChild.textContent = ' Analisi del ritmo in corso…';
+  analysisMessage.textContent = 'Analisi del ritmo in corso…';
   analysisResult.hidden = true;
   analysisNote.hidden = true;
 }
@@ -97,7 +77,7 @@ function showAnalysisLoading() {
 function showAnalysisError(message) {
   analysisPanel.setAttribute('aria-busy', 'false');
   analysisEmpty.hidden = false;
-  analysisEmpty.lastChild.textContent = ` ${message}`;
+  analysisMessage.textContent = message;
   analysisResult.hidden = true;
   analysisNote.hidden = true;
 }
@@ -128,7 +108,6 @@ async function analyzeSong() {
 
   const data = new FormData();
   data.append('audio', audioInput.files[0]);
-  data.append('style', selectedStyle());
   data.append('duration', durationSelect.value);
 
   try {
@@ -232,13 +211,6 @@ audioInput.addEventListener('change', () => {
 
 durationSelect.addEventListener('change', analyzeSong);
 
-form.querySelectorAll('input[name="style"]').forEach((radio) => {
-  radio.addEventListener('change', () => {
-    updatePresetPhases();
-    analyzeSong();
-  });
-});
-
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
   clearFormError();
@@ -297,5 +269,3 @@ newEditButton.addEventListener('click', () => {
   form.scrollIntoView({ behavior: 'smooth', block: 'start' });
   mediaInput.focus({ preventScroll: true });
 });
-
-updatePresetPhases();

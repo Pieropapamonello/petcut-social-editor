@@ -105,29 +105,22 @@ class AudioAnalysisTests(unittest.TestCase):
         self.assertEqual(first["onsets"], [])
         self.assertEqual(first["drop_time"], 5.0)
 
-    def test_recommendations_cover_every_supported_style(self):
+    def test_recommendation_describes_single_reference_edit(self):
         rhythm = {
             "edit_bpm": 140.0,
             "drop_time": 7.2,
             "duration": 15.0,
         }
-        for style in (
-            "animal_roulette",
-            "mystery_reveal",
-            "kinetic_strips",
-            "beat_montage",
-        ):
-            with self.subTest(style=style):
-                result = recommendation(style, 15.0, rhythm, media_count=1)
-                self.assertEqual(
-                    {"ideal_media", "min_media", "visual_cuts", "phases", "note"},
-                    set(result),
-                )
-                self.assertEqual(result["min_media"], 1)
-                self.assertGreaterEqual(result["ideal_media"], 4)
-                self.assertGreater(result["visual_cuts"], 5)
-                self.assertTrue(any(phase["name"] == "drop" for phase in result["phases"]))
-                self.assertIn("solo contenuto", result["note"])
+        result = recommendation("reference_edit", 15.0, rhythm, media_count=1)
+        self.assertEqual(
+            {"ideal_media", "min_media", "visual_cuts", "phases", "note"},
+            set(result),
+        )
+        self.assertEqual(result["min_media"], 1)
+        self.assertGreaterEqual(result["ideal_media"], 8)
+        self.assertGreater(result["visual_cuts"], 20)
+        self.assertEqual([phase["name"] for phase in result["phases"]], ["intro", "roulette", "frase", "climax"])
+        self.assertIn("solo contenuto", result["note"])
 
 
 if __name__ == "__main__":

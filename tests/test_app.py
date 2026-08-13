@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+from PIL import Image
 
 import app as app_module
 
@@ -40,28 +41,26 @@ class AppContractTests(unittest.TestCase):
         app.config.update(TESTING=True)
         self.client = app.test_client()
 
-    def test_home_and_health_expose_new_presets(self):
+    def test_home_and_health_expose_single_reference_mode(self):
         page = self.client.get("/")
         self.assertEqual(page.status_code, 200)
-        self.assertIn(b"Animal Roulette", page.data)
-        self.assertIn(b"Mystery Reveal", page.data)
+        self.assertIn(b"Il montaggio", page.data)
+        self.assertIn(b"Roulette", page.data)
+        self.assertNotIn(b'name="style"', page.data)
 
         health = self.client.get("/api/health")
         self.assertEqual(health.status_code, 200)
         body = health.get_json()
-        self.assertEqual(body["profile"], "section-aware-v2")
+        self.assertEqual(body["profile"], "reference-match-v4")
         self.assertEqual(body["output"], "576x1024")
-        self.assertEqual(
-            set(body["presets"]),
-            {"animal_roulette", "mystery_reveal", "kinetic_strips", "beat_montage"},
-        )
+        self.assertEqual(body["mode"], "reference_edit")
+        self.assertNotIn("presets", body)
 
     def test_audio_analysis_contract(self):
         response = self.client.post(
             "/api/analyze-audio",
             data={
                 "audio": (click_track(), "song.wav"),
-                "style": "animal_roulette",
                 "duration": "6",
             },
             content_type="multipart/form-data",
@@ -105,6 +104,15 @@ class AppContractTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.get_json()["status"], "complete")
             self.assertIn("persisted", app_module.JOBS)
+
+    def test_uploaded_photo_respects_exif_orientation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "portrait.jpg"
+            exif = Image.Exif()
+            exif[274] = 6
+            Image.new("RGB", (120, 80), "orange").save(source, exif=exif)
+            frame = app_module.source_frame(source, 0, 1)
+            self.assertEqual(frame.size, (80, 120))
 
 
 if __name__ == "__main__":
