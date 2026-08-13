@@ -75,7 +75,7 @@ def extension_allowed(filename, allowed):
 def requested_duration() -> int:
     """Read a bounded duration without turning malformed form data into a 500."""
     try:
-        value = int(request.form.get("duration", "15"))
+        value = int(request.form.get("duration", "24"))
     except (TypeError, ValueError):
         abort(400, "Durata non valida.")
     return min(60, max(5, value))
@@ -322,7 +322,13 @@ def instance_segmenter():
 
 
 def instance_subject_mask(rgb: np.ndarray) -> tuple[np.ndarray | None, tuple[int, int, int, int] | None]:
-    """Return a union mask for relevant COCO people/animals and its tight box."""
+    """Return the single main person/animal instance and its tight box.
+
+    Unioning every detection looked disastrous when a dog sat beside a
+    person: trousers, furniture and the animal became one cutout. Animal
+    instances are preferred when present; otherwise the most central,
+    confident person is used.
+    """
     session = instance_segmenter()
     if session is None:
         return None, None
@@ -356,34 +362,48 @@ def instance_subject_mask(rgb: np.ndarray) -> tuple[np.ndarray | None, tuple[int
         if len(selected) == 0:
             return None, None
 
-        masks = []
+        selected_indices = np.asarray(selected).reshape(-1).astype(int).tolist()
+        animal_indices = [
+            selected_index
+            for selected_index in selected_indices
+            if int(class_ids[candidates[selected_index]]) != 0
+        ]
+        primary_pool = animal_indices or selected_indices
+
+        def primary_score(selected_index: int) -> float:
+            candidate = int(candidates[selected_index])
+            box_x, box_y, box_width, box_height = boxes[selected_index]
+            center_x = box_x + box_width / 2
+            center_y = box_y + box_height / 2
+            centrality = max(
+                0.0,
+                1.0
+                - abs(center_x - size / 2) / (size / 2)
+                - abs(center_y - size / 2) / (size / 2),
+            )
+            area = min(1.0, max(0.0, box_width * box_height / (size * size * 0.45)))
+            return float(confidences[candidate]) * 0.64 + centrality * 0.22 + area * 0.14
+
+        selected_index = max(primary_pool, key=primary_score)
+        candidate = int(candidates[selected_index])
         proto_height, proto_width = prototype.shape[1:]
         xx = np.arange(proto_width)[None, :]
         yy = np.arange(proto_height)[:, None]
-        best_confidence = float(np.max(confidences[candidates[np.asarray(selected).reshape(-1)]]))
-        for selected_index in np.asarray(selected).reshape(-1)[:5]:
-            candidate = candidates[int(selected_index)]
-            if float(confidences[candidate]) < max(0.12, best_confidence * 0.38):
-                continue
-            coefficients = predictions[candidate, 84:]
-            logits = np.clip(coefficients @ prototype.reshape(32, -1), -30, 30)
-            mask = (1.0 / (1.0 + np.exp(-logits))).reshape(proto_height, proto_width)
-            box_x, box_y, box_width, box_height = boxes[int(selected_index)]
-            inside = (
-                (xx >= box_x * proto_width / size)
-                & (xx < (box_x + box_width) * proto_width / size)
-                & (yy >= box_y * proto_height / size)
-                & (yy < (box_y + box_height) * proto_height / size)
-            )
-            mask *= inside
-            mask = cv2.resize(mask, (size, size), interpolation=cv2.INTER_LINEAR)
-            mask = mask[offset_y : offset_y + scaled_height, offset_x : offset_x + scaled_width]
-            masks.append(cv2.resize(mask, (width, height), interpolation=cv2.INTER_LANCZOS4))
-        if not masks:
-            return None, None
-
-        probability = np.max(masks, axis=0)
-        binary = (probability > 0.28).astype(np.uint8)
+        coefficients = predictions[candidate, 84:]
+        logits = np.clip(coefficients @ prototype.reshape(32, -1), -30, 30)
+        probability = (1.0 / (1.0 + np.exp(-logits))).reshape(proto_height, proto_width)
+        box_x, box_y, box_width, box_height = boxes[selected_index]
+        inside = (
+            (xx >= box_x * proto_width / size)
+            & (xx < (box_x + box_width) * proto_width / size)
+            & (yy >= box_y * proto_height / size)
+            & (yy < (box_y + box_height) * proto_height / size)
+        )
+        probability *= inside
+        probability = cv2.resize(probability, (size, size), interpolation=cv2.INTER_LINEAR)
+        probability = probability[offset_y : offset_y + scaled_height, offset_x : offset_x + scaled_width]
+        probability = cv2.resize(probability, (width, height), interpolation=cv2.INTER_LANCZOS4)
+        binary = (probability > 0.34).astype(np.uint8)
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
         component_count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
         if component_count > 1:
@@ -536,7 +556,11 @@ def isolate_subject(frame: Image.Image, motion: np.ndarray | None = None, stabil
         # Instance masks are much cleaner around rugs, furniture and floors
         # than a generic salient-object ellipse. Preserve a soft 2-pixel edge
         # while keeping the learned mask itself authoritative.
-        alpha = np.clip((instance_probability - 0.20) / 0.58, 0, 1)
+        # Keep the learned matte inside the detected instance.  The former
+        # low threshold retained a coloured fringe of rugs, walls and beds;
+        # that fringe became especially obvious against the pure-black
+        # roulette background.
+        alpha = np.clip((instance_probability - 0.30) / 0.46, 0, 1)
         alpha = (alpha * 255).astype(np.uint8)
         lab_instance = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
         instance_lightness, instance_a, instance_b = cv2.split(lab_instance)
@@ -549,14 +573,19 @@ def isolate_subject(frame: Image.Image, motion: np.ndarray | None = None, stabil
         # the learned mask into the original background.
         alpha = cv2.GaussianBlur(alpha, (3, 3), 0)
         foreground_pixels = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)[alpha > 127]
-        if foreground_pixels.size and float(np.median(foreground_pixels)) < 85:
-            # A strong gamma curve made dark fur grey and amplified coloured
-            # edge contamination.  A small linear shadow lift keeps the
-            # source texture and colour intact while remaining readable on
-            # the black reference background.
+        if foreground_pixels.size and float(np.median(foreground_pixels)) < 95:
+            # Lift luminance in Lab space so black fur stays coloured and its
+            # texture remains visible against the roulette's black canvas.
+            # A linear lift barely changed near-black pixels; the adaptive
+            # curve targets those shadows without clipping eyes/highlights.
             median_luma = float(np.median(foreground_pixels))
-            gain, lift = ((1.14, 10.0) if median_luma < 55 else (1.07, 6.0))
-            enhanced = np.clip(rgb.astype(np.float32) * gain + lift, 0, 255).astype(np.uint8)
+            gamma = 0.48 if median_luma < 45 else 0.68
+            lab_enhanced = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+            light = lab_enhanced[:, :, 0].astype(np.float32) / 255.0
+            lab_enhanced[:, :, 0] = np.clip(np.power(light, gamma) * 198 + 50, 0, 255).astype(np.uint8)
+            enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
+            blurred = cv2.GaussianBlur(enhanced, (0, 0), 0.75)
+            enhanced = cv2.addWeighted(enhanced, 1.38, blurred, -0.38, 0)
             rgb = np.where((alpha > 0)[:, :, None], enhanced, rgb)
         return Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
 
@@ -633,47 +662,136 @@ def isolate_subject(frame: Image.Image, motion: np.ndarray | None = None, stabil
     alpha = cv2.GaussianBlur(alpha, (5, 5), 0)
 
     foreground_pixels = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)[alpha > 127]
-    if foreground_pixels.size and float(np.median(foreground_pixels)) < 85:
+    if foreground_pixels.size and float(np.median(foreground_pixels)) < 95:
         median_luma = float(np.median(foreground_pixels))
-        gain, lift = ((1.14, 10.0) if median_luma < 55 else (1.07, 6.0))
-        enhanced = np.clip(rgb.astype(np.float32) * gain + lift, 0, 255).astype(np.uint8)
+        gamma = 0.48 if median_luma < 45 else 0.68
+        lab_enhanced = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+        light = lab_enhanced[:, :, 0].astype(np.float32) / 255.0
+        lab_enhanced[:, :, 0] = np.clip(np.power(light, gamma) * 198 + 50, 0, 255).astype(np.uint8)
+        enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
+        blurred = cv2.GaussianBlur(enhanced, (0, 0), 0.75)
+        enhanced = cv2.addWeighted(enhanced, 1.38, blurred, -0.38, 0)
         rgb = np.where((alpha > 0)[:, :, None], enhanced, rgb)
     return Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
 
 
+def cutout_quality(subject: Image.Image) -> float:
+    """Score a matte by shape and retained detail, never by identity.
+
+    This is deliberately relative: a valid person can have a less convex
+    silhouette than a dog, but a rectangle of bed/wall is still penalised.
+    `create_cutouts` keeps the best candidates from the current upload rather
+    than enforcing one universal threshold across pets and people.
+    """
+    alpha = np.asarray(subject.convert("RGBA").getchannel("A"), dtype=np.uint8)
+    points = cv2.findNonZero((alpha > 127).astype(np.uint8))
+    if points is None:
+        return 0.0
+    left, top, width, height = cv2.boundingRect(points)
+    if width < 4 or height < 4:
+        return 0.0
+    cropped = (alpha[top : top + height, left : left + width] > 127).astype(np.uint8)
+    area = float(np.count_nonzero(cropped))
+    fill = area / max(1.0, float(width * height))
+    perimeter = max(1.0, float(2 * width + 2 * height - 4))
+    edge = (
+        np.count_nonzero(cropped[0])
+        + np.count_nonzero(cropped[-1])
+        + np.count_nonzero(cropped[1:-1, 0])
+        + np.count_nonzero(cropped[1:-1, -1])
+    ) / perimeter
+    contours, _ = cv2.findContours(cropped, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0
+    main = max(contours, key=cv2.contourArea)
+    hull_area = max(1.0, float(cv2.contourArea(cv2.convexHull(main))))
+    solidity = min(1.0, float(cv2.contourArea(main)) / hull_area)
+    significant = sum(cv2.contourArea(contour) >= area * 0.035 for contour in contours)
+
+    # Neural mattes occasionally retain the outer silhouette while punching
+    # dozens of transparent islands through the animal (eyes, muzzle, hands
+    # and furniture in the same mask).  Shape/solidity alone scores those
+    # masks surprisingly well.  Legitimate gaps between legs live mostly in
+    # the lower third and there are normally only one or two; several sizeable
+    # holes through the upper two-thirds are therefore a reliable corruption
+    # signal without penalising a dark or low-contrast subject.
+    inverse = (1 - cropped).astype(np.uint8)
+    padded = np.pad(inverse, 1, constant_values=1)
+    flooded = padded.copy()
+    flood_mask = np.zeros((padded.shape[0] + 2, padded.shape[1] + 2), np.uint8)
+    cv2.floodFill(flooded, flood_mask, (0, 0), 2)
+    enclosed_holes = (flooded[1:-1, 1:-1] == 1).astype(np.uint8)
+    hole_ratio = float(np.count_nonzero(enclosed_holes)) / max(1.0, area)
+    hole_count, _, hole_stats, _ = cv2.connectedComponentsWithStats(enclosed_holes, 8)
+    minimum_hole = max(20.0, area * 0.00025)
+    significant_holes = sum(
+        hole_stats[index, cv2.CC_STAT_AREA] >= minimum_hole
+        for index in range(1, hole_count)
+    )
+    if hole_ratio >= 0.06 and significant_holes >= 3:
+        return 0.0
+
+    score = 1.0
+    # The matte is deliberately cropped to its alpha bounds, so a few paws,
+    # ears or the top of a portrait touching that new edge are normal.  Only
+    # broad edge contact is evidence that a rectangular piece of background
+    # survived segmentation.
+    score -= min(0.65, max(0.0, edge - 0.28) * 2.3)
+    score -= max(0.0, 0.68 - solidity) * 2.8
+    score -= max(0.0, fill - 0.85) * 2.8
+    score -= max(0, significant - 1) * 0.10
+    rgba = np.asarray(subject.convert("RGBA"), dtype=np.uint8)
+    gray = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2GRAY)
+    visible = rgba[:, :, 3] > 127
+    contrast = float(np.std(gray[visible])) if np.any(visible) else 0.0
+    laplacian = cv2.Laplacian(gray, cv2.CV_32F)
+    sharpness = float(np.var(laplacian[visible])) if np.any(visible) else 0.0
+    appearance = 0.60 * min(1.0, contrast / 35.0) + 0.40 * min(1.0, sharpness / 180.0)
+    score *= 0.35 + 0.65 * appearance
+    return float(max(0.0, min(1.0, score)))
+
+
 def create_cutouts(paths: list[Path], job_dir: Path, count: int) -> tuple[list[Path], list[Path]]:
-    cutouts, samples, records = [], [], []
+    samples, records = [], []
     for index in range(count):
         source = paths[index % len(paths)]
         frame = source_frame(source, index // len(paths), max(1, math.ceil(count / len(paths))))
-        sample = job_dir / f"sample-{index}.jpg"
+        sample = job_dir / f"sample-{index:02d}-source-{index % len(paths):02d}.jpg"
         frame.convert("RGB").save(sample, quality=94)
         samples.append(sample)
         records.append((source, frame))
 
-    contexts = {}
-    for source in paths:
-        source_frames = [np.array(frame.convert("RGB")) for record_source, frame in records if record_source == source]
-        if len(source_frames) >= 3 and len({array.shape for array in source_frames}) == 1:
-            stack = np.stack(source_frames)
-            median = np.median(stack, axis=0).astype(np.uint8)
-            gray_stack = np.stack([cv2.cvtColor(array, cv2.COLOR_RGB2GRAY) for array in source_frames]).astype(np.int16)
-            gray_median = np.median(gray_stack, axis=0)
-            contexts[source] = (median, np.median(np.abs(gray_stack - gray_median), axis=0))
-
+    candidates: list[tuple[float, Path, Path]] = []
     for index, (source, frame) in enumerate(records):
-        context = contexts.get(source)
-        motion = None if context is None else cv2.cvtColor(cv2.absdiff(np.array(frame.convert("RGB")), context[0]), cv2.COLOR_RGB2GRAY)
-        stability = None if context is None else context[1]
-        result = isolate_subject(frame, motion, stability)
+        # Frames sampled seconds apart often belong to different shots.  A
+        # temporal median across those shots marks the whole changed room as
+        # foreground, so segmentation must be evaluated independently.
+        result = isolate_subject(frame)
+        quality = cutout_quality(result)
         bounds = result.getchannel("A").getbbox()
         if bounds:
             result = result.crop(bounds)
         result.thumbnail((520, 820), Image.Resampling.LANCZOS)
         destination = job_dir / f"cutout-{index}.png"
         result.save(destination)
-        cutouts.append(destination)
-    return cutouts, samples
+        candidates.append((quality, destination, samples[index]))
+
+    # Reject obvious rectangular/background mattes while remaining useful
+    # when the upload contains only people or a single difficult frame.  The
+    # renderer can safely reuse a clean pose; one broken matte is far more
+    # noticeable than a repeated clean one.
+    ranked = sorted(candidates, key=lambda item: item[0], reverse=True)
+    best = ranked[0][0] if ranked else 0.0
+    selected = [item for item in candidates if item[0] >= max(0.30, best - 0.12)]
+    minimum = min(len(ranked), 1)
+    if len(selected) < minimum:
+        selected_paths = {path for _, path, _ in selected}
+        selected.extend(item for item in ranked if item[1] not in selected_paths and len(selected) < minimum)
+    if not selected:
+        selected = ranked[:1]
+    cutouts = [path for _, path, _ in selected]
+    selected_samples = [sample for _, _, sample in selected]
+    return cutouts, selected_samples
 
 
 def split_title_words(_title: str) -> list[str]:
@@ -897,7 +1015,7 @@ def health():
         output=f"{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}",
         fps=30,
         mode=REFERENCE_STYLE,
-        profile="reference-match-v4",
+        profile="reference-match-v5",
     )
 
 

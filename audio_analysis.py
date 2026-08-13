@@ -537,26 +537,47 @@ def recommendation(
     minimum_drop = duration * (0.50 if duration < 8 else 0.40)
     drop = min(max(drop, minimum_drop), max(minimum_drop, duration - 0.8))
 
-    # Normalised from Download (5): 3.23 / 8.50 / 11.47 seconds before
-    # the drop, followed by a 12.76-second full-frame climax.
-    intro_end = drop * (3.23 / 11.47)
-    roulette_end = drop * (8.50 / 11.47)
-    phrase_build_end = drop * (9.20 / 11.47)
-    intro_slots = 4 if duration >= 8 else 2
+    # Download (5) begins its visual impact cluster 1.5 edit beats before
+    # the largest energy jump. Mirror the renderer so this preview describes
+    # the cue sheet that will actually be exported.
+    target = drop - 1.5 * beat
+    visual_candidates = []
+    for onset, strength in zip(rhythm.get("onsets", []) or [], rhythm.get("onset_strengths", []) or []):
+        onset = _finite_float(onset, -1.0)
+        strength = _finite_float(strength, 0.0)
+        if strength >= 0.72 and abs(onset - target) <= 0.16:
+            visual_candidates.append(onset)
+    if visual_candidates:
+        drop = min(visual_candidates, key=lambda value: abs(value - target))
+    drop = _quantize_time(drop, duration)
+
+    # Musical cue sheet measured from Download (5). At 160 edit BPM these
+    # reproduce its exact F97/F255/F276/F344 act boundaries. A short build
+    # uses two intro cards so the five words retain six readable beats.
+    pre_drop_beats = drop / max(beat, 1 / 30)
+    intro_slots = 4 if pre_drop_beats >= 24 else 2
+    intro_end = intro_slots * (97 / 45) * beat
+    phrase_build_end = drop - (272 / 45) * beat
+    roulette_end = phrase_build_end - (28 / 15) * beat
+    roulette_end = max(intro_end + 2 * beat, roulette_end)
+    phrase_build_end = max(roulette_end + 4 / 30, min(drop - 15 / 30, phrase_build_end))
+    roulette_end = min(roulette_end, phrase_build_end - 4 / 30)
+    intro_end = max(8 / 30, min(intro_end, roulette_end - 4 / 30))
     slot_frames = max(4, round(intro_end * 30 / intro_slots))
     cut_frames = slot_frames - max(2, min(slot_frames - 2, round(slot_frames * 0.55)))
     poses_per_slot = max(1, min(4, round(cut_frames / 3)))
     intro_cuts = intro_slots * (1 + poses_per_slot)
     roulette_frames = max(1, round((roulette_end - intro_end) * 30))
-    roulette_cuts = max(8, min(48, round(roulette_frames / 3.35), roulette_frames // 2))
-    phrase_build_cuts = max(2, min(5, round((phrase_build_end - roulette_end) / max(0.14, beat * 0.50))))
+    entry_frames = min(max(2, roulette_frames - 2), max(2, round((44 / 45) * beat * 30)))
+    roulette_cuts = 1 + max(1, min(48, round(max(1, roulette_frames - entry_frames) / 3.06)))
+    phrase_build_cuts = max(2, min(4, round((phrase_build_end - roulette_end) / max(0.14, beat * 0.62))))
     phrase_cuts = 5
     impact_cuts = 4 if duration - drop >= 27 / 30 else max(0, int((duration - drop) * 30 // 6))
     raw_seconds = max(0.0, duration - drop - 23 / 30)
-    climax_cuts = impact_cuts + (max(1, min(60, round(37 * raw_seconds / (24.233 - 12.234)))) if raw_seconds >= 4 / 30 else 0)
+    climax_cuts = impact_cuts + (max(1, min(60, round(raw_seconds / max(4 / 30, beat * 0.865)))) if raw_seconds >= 4 / 30 else 0)
     phases = [
         {"name": "intro", "start": 0.0, "end": _quantize_time(intro_end, duration), "cuts": intro_cuts, "effect": "clip con nome → cutout nero"},
-        {"name": "roulette", "start": _quantize_time(intro_end, duration), "end": _quantize_time(roulette_end, duration), "cuts": roulette_cuts, "effect": "pose alternate ogni mezzo beat"},
+        {"name": "roulette", "start": _quantize_time(intro_end, duration), "end": _quantize_time(roulette_end, duration), "cuts": roulette_cuts, "effect": "pose alternate ogni quarto di battuta"},
         {"name": "frase", "start": _quantize_time(roulette_end, duration), "end": _quantize_time(drop, duration), "cuts": phrase_build_cuts + phrase_cuts, "effect": "CAN YOU IMAGINE FLOATING WEIGHTLESS"},
         {"name": "climax", "start": _quantize_time(drop, duration), "end": duration, "cuts": climax_cuts, "effect": "hard cut, whip, flash e zoom blur"},
     ]
@@ -565,15 +586,19 @@ def recommendation(
     minimum_media = 1
     media_count = max(0, int(_finite_float(media_count, 0.0)))
 
+    duration_note = (
+        f"Il brano disponibile dura {duration:.1f} secondi: per la struttura completa del riferimento usa circa 24 secondi di musica. "
+        if duration < 20 else ""
+    )
     if media_count <= 1:
-        note = f"Funziona anche con un solo contenuto; per replicare la varietà del riferimento sono ideali {ideal_media} foto o clip con pose diverse."
+        note = duration_note + f"Funziona anche con un solo contenuto; per replicare la varietà del riferimento sono ideali {ideal_media} foto o clip con pose diverse."
     elif media_count < ideal_media:
-        note = (
+        note = duration_note + (
             f"Il montaggio funziona con {media_count} contenuti, ma {ideal_media} permettono "
             "più varietà nel climax senza ripetere le stesse inquadrature."
         )
     else:
-        note = "Materiale sufficiente per mantenere pose diverse nella roulette e nel climax."
+        note = duration_note + "Materiale sufficiente per mantenere pose diverse nella roulette e nel climax."
 
     return {
         "ideal_media": ideal_media,

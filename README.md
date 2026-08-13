@@ -13,6 +13,8 @@ PetCut produce un solo stile, ricostruito sul riferimento fornito:
 3. collage con la frase `CAN YOU IMAGINE FLOATING WEIGHTLESS`;
 4. climax full-frame con hard cut, whip, flash e zoom blur sul drop.
 
+La durata consigliata è 24 secondi, come il riferimento. Se la canzone è più corta, PetCut adatta la cue sheet in battute e riduce automaticamente le card introduttive per lasciare leggibile la frase centrale. Le maschere con sfondo, bordi rettangolari o poco dettaglio vengono escluse prima del montaggio.
+
 Per creare i livelli, il soggetto viene individuato localmente con un modello ONNX incluso nel repository. Non vengono inviati file a servizi AI esterni. Le informazioni sul modello sono in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Avvio locale

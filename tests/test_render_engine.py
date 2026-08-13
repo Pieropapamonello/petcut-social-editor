@@ -1,11 +1,18 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+import inspect
 
 from render_engine import (
     _drop_time,
     _durations,
+    _finish,
+    _intro_video_clip,
+    _intro_asset_groups,
     _onset_aligned_weighted_durations,
+    _reference_cues,
     _visual_drop_time,
     _weighted_frame_durations,
     render_preset,
@@ -31,6 +38,21 @@ class RenderTimelineTests(unittest.TestCase):
             "onset_strengths": [0.81, 0.82, 0.96],
         }
         self.assertAlmostEqual(_visual_drop_time(rhythm, 24.0, 11.5), 11.466667, places=5)
+
+    def test_reference_cues_reproduce_measured_frames(self):
+        cues = _reference_cues(344 / 30, 60 / 160, 727 / 30)
+        self.assertEqual(cues["intro_slots"], 4)
+        self.assertEqual(round(float(cues["intro_end"]) * 30), 97)
+        self.assertEqual(round(float(cues["roulette_end"]) * 30), 255)
+        self.assertEqual(round(float(cues["phrase_start"]) * 30), 276)
+        self.assertEqual(round(float(cues["drop"]) * 30), 344)
+
+    def test_short_build_keeps_words_readable_with_two_cards(self):
+        beat = 60 / 138
+        cues = _reference_cues(214 / 30, beat, 437 / 30)
+        self.assertEqual(cues["intro_slots"], 2)
+        word_frames = round((float(cues["drop"]) - float(cues["phrase_start"])) * 30)
+        self.assertGreaterEqual(word_frames, 75)
 
     def test_weighted_cue_sheet_preserves_exact_frames(self):
         values = _weighted_frame_durations(8.5, 11.466667, [21, 7, 7, 22, 13, 19], minimum=3)
@@ -59,6 +81,45 @@ class RenderTimelineTests(unittest.TestCase):
                     {},
                     "",
                 )
+
+    def test_intro_video_does_not_fade_from_white(self):
+        with tempfile.TemporaryDirectory() as directory, patch("render_engine._run") as run:
+            root = Path(directory)
+            _intro_video_clip(root / "source.mp4", root / "overlay.png", root / "out.mp4", 0.0, 0.5)
+            command = " ".join(str(value) for value in run.call_args.args[0])
+            self.assertNotIn("fade=t=in", command)
+            self.assertNotIn("color=white", command)
+
+    def test_intro_assets_stay_grouped_by_upload_source(self):
+        paths = [Path("first.mp4"), Path("second.mp4"), Path("third.jpg")]
+        images = [
+            Path("sample-01-source-01.jpg"),
+            Path("sample-04-source-01.jpg"),
+            Path("sample-02-source-02.jpg"),
+            Path("original-appended.jpg"),
+        ]
+        cutouts = [Path("dog-b.png"), Path("dog-b-pose.png"), Path("dog-c.png")]
+        groups = _intro_asset_groups(paths, images, cutouts)
+        self.assertEqual([source for source, _ in groups], [1, 2])
+        self.assertEqual(groups[0][1][0], (images[0], cutouts[0]))
+        self.assertEqual(groups[0][1][1], (images[1], cutouts[1]))
+        self.assertEqual(groups[1][1][0], (images[2], cutouts[2]))
+
+    def test_finish_normalises_reference_colour_metadata(self):
+        with tempfile.TemporaryDirectory() as directory, patch("render_engine._run") as run:
+            root = Path(directory)
+            clip = root / "clip.mp4"
+            _finish([clip], root / "audio.wav", root / "out.mp4", 1.0, root)
+            command = [str(value) for value in run.call_args.args[0]]
+            self.assertIn("libx264", command)
+            self.assertIn("yuv420p", command)
+            self.assertIn("tv", command)
+            self.assertGreaterEqual(command.count("bt709"), 3)
+
+    def test_climax_periodic_accents_are_sparse(self):
+        source = inspect.getsource(__import__("render_engine")._render_reference_edit)
+        self.assertEqual(source.count("index % 3 == 0"), 2)
+        self.assertNotIn("index % 4 != 3", source)
 
 
 if __name__ == "__main__":

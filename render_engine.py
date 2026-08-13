@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
@@ -114,13 +115,46 @@ def _center_text(
     max_width: int = WIDTH - 48,
     start_size: int = 82,
     fill: str = "white",
-    stroke: int = 3,
+    stroke: int = 0,
     condensed: bool = False,
 ) -> None:
     font = _text_fit(draw, text, max_width, start_size, condensed)
     box = draw.textbbox((0, 0), text, font=font, stroke_width=stroke)
     x = (WIDTH - (box[2] - box[0])) // 2
     draw.text((x, y), text, font=font, fill=fill, stroke_width=stroke, stroke_fill="black")
+
+
+def _reference_cues(drop: float, beat: float, duration: float) -> dict[str, float | int]:
+    """Scale the measured Download (5) cue sheet in musical beats.
+
+    At 160 edit BPM these formulas reproduce the reference's exact act
+    boundaries: F97, F255, F276 and F344.  A short pre-drop automatically
+    uses two intro cards so the five-word phrase keeps its readable six-beat
+    hold instead of being crushed into a few frames.
+    """
+    pre_drop_beats = drop / max(beat, 1 / FPS)
+    intro_slots = 4 if pre_drop_beats >= 24.0 else 2
+    intro_end = intro_slots * (97 / 45) * beat
+    phrase_start = drop - (272 / 45) * beat
+    roulette_end = phrase_start - (28 / 15) * beat
+
+    # Preserve at least two beats of roulette and four frames for every word
+    # on unusually short tracks while keeping all boundaries frame-exact.
+    roulette_end = max(intro_end + 2 * beat, roulette_end)
+    phrase_start = max(roulette_end + 4 / FPS, phrase_start)
+    if phrase_start > drop - 15 / FPS:
+        phrase_start = drop - 15 / FPS
+        roulette_end = min(roulette_end, phrase_start - 4 / FPS)
+    intro_end = min(intro_end, roulette_end - 4 / FPS)
+    intro_end = max(8 / FPS, intro_end)
+    roulette_end = max(intro_end + 4 / FPS, roulette_end)
+    return {
+        "intro_slots": intro_slots,
+        "intro_end": round(intro_end * FPS) / FPS,
+        "roulette_end": round(roulette_end * FPS) / FPS,
+        "phrase_start": round(phrase_start * FPS) / FPS,
+        "drop": round(min(duration - 0.8, drop) * FPS) / FPS,
+    }
 
 
 def _onsets(rhythm: dict, duration: float) -> list[float]:
@@ -434,8 +468,13 @@ def _still_clip(image_path: Path, destination: Path, duration: float, mode: str,
         # Keep it subtle so the subject is stable, but never a frozen JPEG.
         z = f"1.012+0.014*sin(PI*on/{last})"
         x, y = f"iw/2-(iw/zoom/2)+3*sin(2*PI*on/{last})", f"ih/2-(ih/zoom/2)-3*sin(PI*on/{last})"
-    elif mode in {"push", "intro-out", "intro-in"}:
+    elif mode in {"push", "intro-out"}:
         z = f"1+0.10*(on/{last})"
+        x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+    elif mode == "intro-in":
+        # Raw cards in the reference begin on the source image, never on a
+        # full white frame.  A two-frame punch supplies the entrance energy.
+        z = f"1.055-0.045*min(1\\,on/2)"
         x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
     elif mode == "pull":
         z = f"1.10-0.10*(on/{last})"
@@ -447,15 +486,17 @@ def _still_clip(image_path: Path, destination: Path, duration: float, mode: str,
         z = "1.08"
         x, y = f"(iw-iw/zoom)*(1-on/{last})", "ih/2-(ih/zoom/2)"
     elif mode == "roulette":
-        # The source edit changes pose every few frames, yet each microclip
-        # still carries visible scale/position motion instead of freezing.
-        direction = -1 if index % 2 else 1
-        if index % 3 == 1:
-            z = f"1.115-0.105*(on/{last})"
-        else:
-            z = f"1.010+0.105*(on/{last})"
-        x = f"iw/2-(iw/zoom/2)+{direction}*20*(on/{last})"
-        y = f"ih/2-(ih/zoom/2)-12*(on/{last})"
+        # Download (5) gets its energy from a different pose every 3–4
+        # frames.  Animating inside such a tiny shot made PetCut look like a
+        # continuous mechanical zoom instead of a clean roulette.
+        z, x, y = "1.0", "0", "0"
+    elif mode == "roulette-entry":
+        z = f"1.09-0.09*min(1\\,on/6)"
+        x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
+    elif mode == "collage":
+        z = f"1.005+0.028*sin(PI*on/{last})"
+        x = f"iw/2-(iw/zoom/2)+4*sin(2*PI*on/{last})"
+        y = f"ih/2-(ih/zoom/2)-3*sin(PI*on/{last})"
     else:
         z = f"1+0.05*sin(PI*on/{last})"
         x, y = "iw/2-(iw/zoom/2)", "ih/2-(ih/zoom/2)"
@@ -472,13 +513,26 @@ def _still_clip(image_path: Path, destination: Path, duration: float, mode: str,
         filters.append(f"gblur=sigma=7:enable='gt(t,{max(0.0, duration - transition):.3f})'")
         filters.append(f"fade=t=out:st={max(0.0, duration - transition):.3f}:d={transition:.3f}:color=white")
     elif mode == "intro-in":
-        transition = min(0.067, max(1 / FPS, duration * 0.24))
-        filters.append(f"fade=t=in:st=0:d={transition:.3f}:color=white")
+        filters.append("gblur=sigma=3:enable='eq(n,0)'")
+    if mode == "roulette-entry":
+        filters.extend([
+            "gblur=sigma=8:enable='lt(n,4)'",
+            "drawbox=color=white@0.88:t=fill:enable='eq(n,0)'",
+            "drawbox=color=white@0.72:t=fill:enable='eq(n,1)'",
+            "drawbox=color=white@0.55:t=fill:enable='eq(n,2)'",
+            "drawbox=color=white@0.39:t=fill:enable='eq(n,3)'",
+            "drawbox=color=white@0.24:t=fill:enable='eq(n,4)'",
+            "drawbox=color=white@0.10:t=fill:enable='eq(n,5)'",
+        ])
     if impact:
         filters.extend([
-            "drawbox=color=white@0.68:t=fill:enable='eq(n,0)'",
-            "drawbox=color=white@0.34:t=fill:enable='eq(n,1)'",
-            "drawbox=color=white@0.12:t=fill:enable='eq(n,2)'",
+            "gblur=sigma=7:enable='lt(n,2)'",
+            "drawbox=color=white@0.82:t=fill:enable='eq(n,0)'",
+            "drawbox=color=white@0.66:t=fill:enable='eq(n,1)'",
+            "drawbox=color=white@0.49:t=fill:enable='eq(n,2)'",
+            "drawbox=color=white@0.32:t=fill:enable='eq(n,3)'",
+            "drawbox=color=white@0.17:t=fill:enable='eq(n,4)'",
+            "drawbox=color=white@0.07:t=fill:enable='eq(n,5)'",
         ])
     elif accent:
         filters.extend([
@@ -500,7 +554,7 @@ def _video_clip(
     frames = max(1, round(duration * FPS))
     last = max(1, frames - 1)
     direction = -1 if index % 2 else 1
-    timing = "PTS/1.35" if mode == "speed" else "PTS"
+    timing = "PTS/1.35" if mode == "speed" else ("PTS/1.16" if mode in {"beat", "whip", "punch"} else "PTS")
     scale_filter = f"scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,crop={WIDTH}:{HEIGHT}"
     if mode in {"whip", "punch", "pull", "detail", "hflip"}:
         scale_filter = "scale=620:1102:force_original_aspect_ratio=increase,crop=576:1024"
@@ -517,27 +571,33 @@ def _video_clip(
         filters.append("hflip")
     exit_start = max(0, last - 4)
     if mode == "beat":
-        filters.append(f"zoompan=z='1.00+0.04*max(0\\,(on-{exit_start})/4)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
+        filters.append(f"zoompan=z='1.00+0.40*(on/{last})':x='iw/2-(iw/zoom/2)+{direction}*54*sin(PI*on/{last})':y='ih/2-(ih/zoom/2)-38*(on/{last})':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
     elif mode == "whip":
-        filters.append(f"zoompan=z='1.02+0.08*(1-min(1\\,on/4))+0.08*max(0\\,(on-{exit_start})/4)':x='iw/2-(iw/zoom/2)+{direction}*34*(1-min(1\\,on/4))-{direction}*34*max(0\\,(on-{exit_start})/4)':y='ih/2-(ih/zoom/2)':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
+        filters.append(f"zoompan=z='1.02+0.18*(1-min(1\\,on/3))+0.36*(on/{last})+0.12*max(0\\,(on-{exit_start})/4)':x='iw/2-(iw/zoom/2)+{direction}*76*(1-min(1\\,on/3))-{direction}*62*max(0\\,(on-{exit_start})/4)':y='ih/2-(ih/zoom/2)-34*(on/{last})':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
         filters.append(f"gblur=sigma=7:enable='eq(n,0)+gte(n,{last})'")
     elif mode == "punch":
-        filters.append(f"zoompan=z='1.02+0.11*(1-min(1\\,on/5))+0.09*max(0\\,(on-{exit_start})/4)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
+        filters.append(f"zoompan=z='1.03+0.23*(1-min(1\\,on/3))+0.38*(on/{last})+0.13*max(0\\,(on-{exit_start})/4)':x='iw/2-(iw/zoom/2)+{direction}*38*sin(PI*on/{last})':y='ih/2-(ih/zoom/2)-22*(on/{last})':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
         filters.append("gblur=sigma=6:enable='eq(n,0)'")
     elif mode == "pull":
-        filters.append(f"zoompan=z='1.13-0.11*min(1\\,on/5)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
+        filters.append(f"zoompan=z='1.42-0.34*min(1\\,on/4)+0.20*(on/{last})':x='iw/2-(iw/zoom/2)-{direction}*54*sin(PI*on/{last})':y='ih/2-(ih/zoom/2)+34*(on/{last})':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
     elif mode == "detail":
-        filters.append(f"zoompan=z='1.12+0.03*sin(PI*on/{last})':x='iw/2-(iw/zoom/2)+18*sin(PI*on/{last})':y='ih/2-(ih/zoom/2)-24':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
+        filters.append(f"zoompan=z='1.08+0.36*(on/{last})':x='iw/2-(iw/zoom/2)+{direction}*58*sin(PI*on/{last})':y='ih/2-(ih/zoom/2)-38+40*(on/{last})':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
     elif mode == "hflip":
-        filters.append(f"zoompan=z='1.02+0.04*max(0\\,(on-{exit_start})/4)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
+        filters.append(f"zoompan=z='1.02+0.38*(on/{last})':x='iw/2-(iw/zoom/2)-{direction}*54*sin(PI*on/{last})':y='ih/2-(ih/zoom/2)-36*(on/{last})':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
+    elif mode.startswith("close-"):
+        filters.append(f"zoompan=z='1.01+0.36*(on/{last})':x='iw/2-(iw/zoom/2)+{direction}*54*(on/{last})':y='ih/2-(ih/zoom/2)-38*sin(PI*on/{last})':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
+    elif mode == "speed":
+        filters.append(f"zoompan=z='1.01+0.40*(on/{last})':x='iw/2-(iw/zoom/2)+{direction}*48*sin(PI*on/{last})':y='ih/2-(ih/zoom/2)-48*(on/{last})':d=1:s={WIDTH}x{HEIGHT}:fps={FPS}")
     else:
         filters.append(f"fps={FPS}")
-    filters.extend(["eq=contrast=1.08:saturation=1.18", "unsharp=5:5:0.42"])
+    filters.extend(["eq=gamma=1.20:contrast=1.07:saturation=1.08:brightness=0.015", "unsharp=5:5:0.48"])
     if accent:
         filters.extend([
-            "drawbox=color=white@0.58:t=fill:enable='eq(n,0)'",
-            "drawbox=color=white@0.24:t=fill:enable='eq(n,1)'",
+            "drawbox=color=white@0.68:t=fill:enable='eq(n,0)'",
+            "drawbox=color=white@0.30:t=fill:enable='eq(n,1)'",
         ])
+        if frames >= 8 and index % 2 == 0:
+            filters.append(f"drawbox=color=white@0.24:t=fill:enable='eq(n,{frames // 2})'")
     _run(["ffmpeg", "-y", "-stream_loop", "-1", "-ss", f"{max(0.0, start):.3f}", "-i", source, "-frames:v", frames, "-vf", ",".join(filters), "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22", "-threads", "1", "-pix_fmt", "yuv420p", "-r", FPS, "-g", 15, "-keyint_min", 1, "-sc_threshold", 0, destination])
 
 
@@ -550,10 +610,14 @@ def _intro_video_clip(
 ) -> None:
     """Render a live raw card with typography over the moving source."""
     frames = max(1, round(duration * FPS))
+    last = max(1, frames - 1)
     filters = (
         f"[0:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
-        f"crop={WIDTH}:{HEIGHT},gblur=sigma=6:enable='lt(n,2)',"
-        f"fade=t=in:st=0:d={2 / FPS:.4f}:color=white,fps={FPS}[base];"
+        f"crop={WIDTH}:{HEIGHT},zoompan=z='1.01+0.10*(on/{last})':"
+        f"x='iw/2-(iw/zoom/2)+14*sin(PI*on/{last})':"
+        f"y='ih/2-(ih/zoom/2)-10*(on/{last})':d=1:s={WIDTH}x{HEIGHT}:fps={FPS},"
+        f"eq=contrast=1.04:saturation=1.12,"
+        f"unsharp=5:5:0.35[base];"
         "[base][1:v]overlay=0:0:format=auto,format=yuv420p[out]"
     )
     _run([
@@ -570,7 +634,19 @@ def _finish(clips: Sequence[Path], audio_path: Path, destination: Path, duration
         raise ValueError("No clips were rendered")
     concat_path = job_dir / "engine-clips.txt"
     concat_path.write_text("".join(f"file '{clip.resolve().as_posix()}'\n" for clip in clips), encoding="utf-8")
-    _run(["ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", concat_path, "-i", audio_path, "-t", f"{duration:.3f}", "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-movflags", "+faststart", destination])
+    # Normalise the tiny concat inputs into one CFR, limited-range BT.709
+    # stream.  Copying the first bitstream header leaked JPEG/full-range
+    # metadata into some exports and visibly lifted the black backgrounds.
+    _run([
+        "ffmpeg", "-y", "-v", "error", "-f", "concat", "-safe", "0", "-i", concat_path,
+        "-i", audio_path, "-t", f"{duration:.3f}", "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "1",
+        "-pix_fmt", "yuv420p", "-r", FPS, "-color_range", "tv", "-colorspace", "bt709",
+        "-color_primaries", "bt709", "-color_trc", "bt709", "-x264-params",
+        "colorprim=bt709:transfer=bt709:colormatrix=bt709:range=limited",
+        "-c:a", "aac", "-b:a", "192k",
+        "-ar", "44100", "-movflags", "+faststart", destination,
+    ])
 
 
 class _Timeline:
@@ -620,14 +696,9 @@ def _raw_board(
     # already contains the animal, so compositing a second subject here would
     # duplicate it and hide nearly the whole word.
     intro_text = label.upper()
-    intro_font = _text_fit(draw, intro_text, WIDTH - 20, 170)
-    natural_width = float(draw.textlength(intro_text, font=intro_font))
-    target_width = min(WIDTH - 20, max(WIDTH * 0.72, natural_width))
-    spacing = max(0.0, (target_width - natural_width) / max(1, len(intro_text) - 1))
-    cursor = (WIDTH - target_width) / 2
-    for character in intro_text:
-        draw.text((cursor, int(HEIGHT * 0.50)), character, font=intro_font, fill="white", stroke_width=2, stroke_fill="black")
-        cursor += float(draw.textlength(character, font=intro_font)) + spacing
+    intro_font = _text_fit(draw, intro_text, WIDTH - 48, 112)
+    box = draw.textbbox((0, 0), intro_text, font=intro_font)
+    draw.text(((WIDTH - (box[2] - box[0])) / 2, int(HEIGHT * 0.445)), intro_text, font=intro_font, fill="white")
     return _save(canvas, destination)
 
 
@@ -635,30 +706,22 @@ def _intro_text_overlay(label: str, destination: Path) -> Path:
     canvas = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(canvas)
     text = label.upper()
-    font = _text_fit(draw, text, WIDTH - 20, 170)
-    natural_width = float(draw.textlength(text, font=font))
-    target_width = min(WIDTH - 20, max(WIDTH * 0.72, natural_width))
-    spacing = max(0.0, (target_width - natural_width) / max(1, len(text) - 1))
-    cursor = (WIDTH - target_width) / 2
-    for character in text:
-        draw.text((cursor, int(HEIGHT * 0.50)), character, font=font, fill="white", stroke_width=2, stroke_fill="black")
-        cursor += float(draw.textlength(character, font=font)) + spacing
+    font = _text_fit(draw, text, WIDTH - 48, 112)
+    box = draw.textbbox((0, 0), text, font=font)
+    draw.text(((WIDTH - (box[2] - box[0])) / 2, int(HEIGHT * 0.445)), text, font=font, fill="white")
     return _save(canvas, destination)
 
 
 def _cutout_board(subject_path: Path, destination: Path, index: int, label: str | None = None) -> Path:
     canvas = Image.new("RGBA", (WIDTH, HEIGHT), "black")
-    sizes = ((350, 610), (430, 700), (390, 650), (470, 735))
+    sizes = ((260, 420), (320, 500), (280, 455), (340, 525))
     subject = _fit_subject(_open_rgba(subject_path), *sizes[index % len(sizes)])
     if index % 5 == 2:
         subject = ImageOps.mirror(subject)
-    angle = (0, -4, 3, 0, 5, -3)[index % 6]
-    if angle:
-        subject = subject.rotate(angle, Image.Resampling.BICUBIC, expand=True)
-    offsets = [(-74, -34), (45, -12), (-20, 40), (78, 26), (5, -48), (-52, 42)]
+    offsets = [(-95, -40), (70, -22), (-32, 48), (92, 28), (8, -52), (-68, 42)]
     ox, oy = offsets[index % len(offsets)]
     xy = ((WIDTH - subject.width) // 2 + ox, (HEIGHT - subject.height) // 2 + oy)
-    _paste_with_rim(canvas, subject, xy)
+    _paste_with_rim(canvas, subject, xy, rim=False)
     if label:
         _center_text(ImageDraw.Draw(canvas), label.upper(), int(HEIGHT * 0.67), start_size=78)
     return _save(canvas, destination)
@@ -668,11 +731,20 @@ def _collage_board(subject_paths: Sequence[Path], destination: Path, word: str, 
     """Place text first, then subjects, creating the reference's text-behind z-order."""
     canvas = Image.new("RGBA", (WIDTH, HEIGHT), "black")
     draw = ImageDraw.Draw(canvas)
-    # Safe central band: y 435..590.  Subjects occupy top and bottom lanes.
-    _center_text(draw, word.upper(), 495, max_width=WIDTH - 24, start_size=104)
-    positions = [(22, 72), (302, 92), (4, 650), (308, 660), (172, 36), (170, 704)]
+    # Text sits in the negative-space corridor and is deliberately covered
+    # by the four large subjects, matching the reference's layer order.
+    text = word.upper()
+    if text:
+        measured_sizes = {"CAN": 146, "YOU": 146, "IMAGINE": 108, "FLOATING": 96, "WEIGHTLESS": 80}
+        font = _text_fit(draw, text, WIDTH - 46, measured_sizes.get(text, 108))
+        box = draw.textbbox((0, 0), text, font=font)
+        text_width, text_height = box[2] - box[0], box[3] - box[1]
+        text_x = (WIDTH - text_width) / 2 - box[0]
+        text_y = 548 - text_height / 2 - box[1]
+        draw.text((text_x, text_y), text, font=font, fill="white")
+    positions = [(-18, 84), (288, 104), (-22, 560), (286, 576), (126, 70), (128, 600)]
     for index in range(max(1, count)):
-        subject = _fit_subject(_open_rgba(subject_paths[(index * 3 + layout_seed) % len(subject_paths)]), 265, 330)
+        subject = _fit_subject(_open_rgba(subject_paths[(index * 3 + layout_seed) % len(subject_paths)]), 330, 440)
         if index % 3 == 1:
             subject = ImageOps.mirror(subject)
         x, y = positions[index % len(positions)]
@@ -682,11 +754,27 @@ def _collage_board(subject_paths: Sequence[Path], destination: Path, word: str, 
 
 def _intro_labels(title: str) -> list[str]:
     values = [value.strip().upper() for value in title.replace("|", ",").replace("/", ",").split(",") if value.strip()]
-    if len(values) >= 2:
-        return [values[index % len(values)] for index in range(4)]
     if values:
-        return [values[0], "WATCH", "IMAGINE", "FLOATING"]
-    return ["ANIMAL", "WATCH", "IMAGINE", "FLOATING"]
+        return [values[index % len(values)] for index in range(4)]
+    return ["PET"] * 4
+
+
+def _intro_asset_groups(
+    paths: Sequence[Path], images: Sequence[Path], cutouts: Sequence[Path],
+) -> list[tuple[int, list[tuple[Path, Path]]]]:
+    """Keep every intro raw frame paired with a cutout from its source.
+
+    ``create_cutouts`` returns selected samples and cutouts in the same order;
+    ``_source_assets`` keeps those samples at the beginning of ``images``.
+    Grouping that paired prefix prevents a card for one upload from being
+    followed by the pose of another when a weak matte has been filtered out.
+    """
+    groups: dict[int, list[tuple[Path, Path]]] = {}
+    for pair_index, (source_image, cutout) in enumerate(zip(images, cutouts)):
+        source_match = re.fullmatch(r"sample-\d+-source-(\d+)", source_image.stem)
+        source_index = int(source_match.group(1)) if source_match else pair_index % len(paths)
+        groups.setdefault(source_index % len(paths), []).append((Path(source_image), Path(cutout)))
+    return list(groups.items())
 
 
 def _render_reference_edit(
@@ -701,23 +789,29 @@ def _render_reference_edit(
     # of over-allocating those sections and truncating the final climax.
     minimum_drop = duration * (0.50 if duration < 8 else 0.40)
     drop = round(max(minimum_drop, min(duration - 0.8, drop)) * FPS) / FPS
-    intro_end = _snap(drop * (3.23 / 11.47), onsets, 0.14)
-    roulette_end = _snap(drop * (8.50 / 11.47), onsets, 0.14)
+    cues = _reference_cues(drop, beat, duration)
+    drop = float(cues["drop"])
+    intro_end = float(cues["intro_end"])
+    roulette_end = float(cues["roulette_end"])
+    phrase_start = float(cues["phrase_start"])
     timeline = _Timeline(job_dir, audio, destination, duration, progress)
     labels = _intro_labels(title)
+    intro_sources = _intro_asset_groups(paths, images, cutouts)
 
     # Act 1: each subject gets raw context followed by a cutout pose.
     _notify(progress, "intro", 8)
-    intro_slots = 4 if duration >= 8 else 2
-    slot_durations = _durations(0, intro_end, intro_slots, onsets, 8)
+    intro_slots = int(cues["intro_slots"])
+    slot_weights = [29, 23, 23, 22][:intro_slots]
+    slot_durations = _weighted_frame_durations(0, intro_end, slot_weights, minimum=8)
     for index, slot_duration in enumerate(slot_durations):
         slot_frames = max(4, round(slot_duration * FPS))
         raw_frames = max(2, min(slot_frames - 2, round(slot_frames * 0.55)))
         raw_duration, cut_duration = raw_frames / FPS, (slot_frames - raw_frames) / FPS
-        source_image = images[index % len(images)]
-        label = labels[index % len(labels)]
-        intro_time = sum(slot_durations[:index])
-        original_source = Path(paths[index % len(paths)])
+        source_index, source_assets = intro_sources[index % len(intro_sources)]
+        variant_index = (index // len(intro_sources)) % len(source_assets)
+        source_image, _ = source_assets[variant_index]
+        label = labels[source_index % len(labels)]
+        original_source = Path(paths[source_index])
         slot_video_times = [value for value in video_times if value[0] == original_source]
         if original_source.suffix.lower() in VIDEO_EXTENSIONS and slot_video_times:
             source_video, source_time = slot_video_times[(index // max(1, len(paths))) % len(slot_video_times)]
@@ -736,9 +830,9 @@ def _render_reference_edit(
         pose_count = max(1, min(4, round((slot_frames - raw_frames) / 3)))
         pose_durations = _weighted_frame_durations(0, cut_duration, [1] * pose_count, minimum=2)
         for pose_index, pose_duration in enumerate(pose_durations):
-            cutout_index = (index * 3 + pose_index) % len(cutouts)
+            cutout_path = source_assets[(variant_index + pose_index) % len(source_assets)][1]
             board = _cutout_board(
-                cutouts[cutout_index],
+                cutout_path,
                 job_dir / f"reference-intro-cut-{index:02d}-{pose_index:02d}.png",
                 index * 3 + pose_index,
             )
@@ -746,25 +840,28 @@ def _render_reference_edit(
                 board,
                 pose_duration,
                 "roulette",
-                accent=pose_index == 0 and index > 0 and _accent_or_pattern(intro_time, strong, index, 1),
+                accent=False,
             )
 
     # Act 2: the measured reference cadence is mostly three frames per pose,
     # with a hard cap of 48 poses for a 24-second edit.
     _notify(progress, "roulette", 28)
-    roulette_durations = _dense_durations(intro_end, roulette_end, 3.35, maximum=48)
+    roulette_span_frames = round((roulette_end - intro_end) * FPS)
+    entry_frames = min(max(2, roulette_span_frames - 2), max(2, round((44 / 45) * beat * FPS)))
+    entry_duration = entry_frames / FPS
+    entry_board = _cutout_board(cutouts[0], job_dir / "reference-roulette-entry.png", 0)
+    timeline.add_still(entry_board, entry_duration, "roulette-entry", accent=False)
+    roulette_micro_start = intro_end + entry_duration
+    roulette_durations = _dense_durations(roulette_micro_start, roulette_end, 3.06, maximum=48)
     for index, clip_duration in enumerate(roulette_durations):
         board = _cutout_board(cutouts[(index * 7 + index // max(1, len(cutouts))) % len(cutouts)], job_dir / f"reference-roulette-{index:02d}.png", index + 1)
-        cut_time = intro_end + sum(roulette_durations[:index])
-        timeline.add_still(board, clip_duration, "roulette", accent=index == 0)
+        timeline.add_still(board, clip_duration, "roulette", accent=False)
 
     # Act 3: subjects first accumulate around an empty centre, then the five
     # words use the measured unequal holds from the reference.
     _notify(progress, "collage", 48)
-    phrase_start = _snap(drop * (9.20 / 11.47), onsets, 0.12)
-    phrase_start = max(roulette_end + 4 / FPS, min(drop - 15 / FPS, phrase_start))
-    build_count = max(2, min(5, round((phrase_start - roulette_end) / max(0.14, beat * 0.50))))
-    build_durations = _durations(roulette_end, phrase_start, build_count, onsets, 4)
+    build_count = max(2, min(4, round((phrase_start - roulette_end) / max(0.14, beat * 0.62))))
+    build_durations = _weighted_frame_durations(roulette_end, phrase_start, [1] * build_count, minimum=4)
     for index, clip_duration in enumerate(build_durations):
         board = _collage_board(
             cutouts,
@@ -773,14 +870,13 @@ def _render_reference_edit(
             index + 2,
             0,
         )
-        timeline.add_still(board, clip_duration, "pulse", accent=index == 0)
+        timeline.add_still(board, clip_duration, "collage", accent=False)
 
     words = ["CAN", "YOU", "IMAGINE", "FLOATING", "WEIGHTLESS"]
     collage_durations = _weighted_frame_durations(phrase_start, drop, [7, 7, 22, 13, 19], minimum=3)
     for index, clip_duration in enumerate(collage_durations):
         board = _collage_board(cutouts, job_dir / f"reference-collage-{index:02d}.png", words[index], 4, 0)
-        cut_time = phrase_start + sum(collage_durations[:index])
-        timeline.add_still(board, clip_duration, "pulse", accent=False)
+        timeline.add_still(board, clip_duration, "collage", accent=False)
 
     # Act 4: alternate beat and half-beat source clips. Scored moments avoid
     # dead/off-focus footage; accents are short and sparse.
@@ -794,10 +890,10 @@ def _render_reference_edit(
     impact_durations = [frames / FPS for frames in impact_frames]
     raw_start = drop + sum(impact_durations)
     raw_remaining = max(0.0, duration - raw_start)
-    raw_target_count = max(1, min(60, round(37 * raw_remaining / (24.233 - 12.234)))) if raw_remaining >= 4 / FPS else 0
+    raw_target_count = max(1, min(60, round(raw_remaining / max(4 / FPS, beat * 0.865)))) if raw_remaining >= 4 / FPS else 0
     raw_weights = [climax_pattern[(index + 4) % len(climax_pattern)] for index in range(raw_target_count)]
     raw_durations = (
-        _onset_aligned_weighted_durations(raw_start, duration, raw_weights, onsets, minimum=4, radius_frames=3)
+        _onset_aligned_weighted_durations(raw_start, duration, raw_weights, onsets, minimum=4, radius_frames=2)
         if raw_weights else []
     )
     for index, clip_duration in enumerate(impact_durations):
@@ -823,13 +919,18 @@ def _render_reference_edit(
             )
             mode = modes[index % len(modes)]
             cut_time = raw_start + sum(raw_durations[:index])
-            timeline.add_video(source, max(0, source_time - clip_duration * 0.20), clip_duration, mode, accent=_accent_or_pattern(cut_time, strong, index, 5))
+            # Let detected musical attacks lead the climax.  A sparse
+            # periodic fallback covers weak analyses without flashing on
+            # three out of every four shots and creating off-beat events.
+            accent = _is_accent(cut_time, strong) or index % 3 == 0
+            timeline.add_video(source, max(0, source_time - clip_duration * 0.20), clip_duration, mode, accent=accent)
             _notify(progress, "climax", 62 + round(28 * (index + 1) / max(1, len(raw_durations))))
     else:
         for index, clip_duration in enumerate(raw_durations):
             cut_time = raw_start + sum(raw_durations[:index])
             photo_modes = ("push", "whip-left", "pull", "whip-right", "pulse")
-            timeline.add_still(images[index % len(images)], clip_duration, photo_modes[index % len(photo_modes)], accent=_accent_or_pattern(cut_time, strong, index, 5))
+            accent = _is_accent(cut_time, strong) or index % 3 == 0
+            timeline.add_still(images[index % len(images)], clip_duration, photo_modes[index % len(photo_modes)], accent=accent)
     timeline.finish()
     return {"scenes": len(timeline.clips), "drop_time": drop, "mode": "reference_edit"}
 

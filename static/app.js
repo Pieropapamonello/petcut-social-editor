@@ -94,9 +94,9 @@ function showAnalysis(data) {
   const duration = Number(data.duration) || Number(durationSelect.value);
   const durationLabel = Number.isInteger(duration) ? String(duration) : duration.toFixed(1).replace('.', ',');
   const contents = data.recommended_content;
-  analysisNote.textContent = contents
+  analysisNote.textContent = data.message || (contents
     ? `Per ${durationLabel} secondi di musica sono consigliati circa ${contents} contenuti distinti. Se ne carichi uno solo, PetCut lo riutilizzerà con inquadrature e movimenti diversi.`
-    : (data.message || 'La canzone è pronta per guidare il montaggio.');
+    : 'La canzone è pronta per guidare il montaggio.');
   analysisNote.hidden = false;
 }
 

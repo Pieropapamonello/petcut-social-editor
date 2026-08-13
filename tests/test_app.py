@@ -51,7 +51,7 @@ class AppContractTests(unittest.TestCase):
         health = self.client.get("/api/health")
         self.assertEqual(health.status_code, 200)
         body = health.get_json()
-        self.assertEqual(body["profile"], "reference-match-v4")
+        self.assertEqual(body["profile"], "reference-match-v5")
         self.assertEqual(body["output"], "576x1024")
         self.assertEqual(body["mode"], "reference_edit")
         self.assertNotIn("presets", body)
@@ -113,6 +113,32 @@ class AppContractTests(unittest.TestCase):
             Image.new("RGB", (120, 80), "orange").save(source, exif=exif)
             frame = app_module.source_frame(source, 0, 1)
             self.assertEqual(frame.size, (80, 120))
+
+    def test_cutout_quality_rejects_background_rectangles(self):
+        rectangle = Image.new("RGBA", (160, 220), (120, 90, 70, 255))
+        subject = Image.new("RGBA", (160, 220), (0, 0, 0, 0))
+        yy, xx = np.mgrid[:220, :160]
+        ellipse = (((xx - 80) / 54) ** 2 + ((yy - 110) / 92) ** 2) <= 1
+        subject.putalpha(Image.fromarray((ellipse * 255).astype(np.uint8), "L"))
+        subject_score = app_module.cutout_quality(subject)
+        rectangle_score = app_module.cutout_quality(rectangle)
+        self.assertGreater(subject_score, 0.25)
+        self.assertGreater(subject_score, rectangle_score + 0.20)
+        self.assertLess(rectangle_score, 0.20)
+
+    def test_cutout_quality_rejects_perforated_upper_body(self):
+        clean = Image.new("RGBA", (180, 260), (70, 65, 60, 0))
+        yy, xx = np.mgrid[:260, :180]
+        silhouette = (((xx - 90) / 66) ** 2 + ((yy - 132) / 118) ** 2) <= 1
+        clean.putalpha(Image.fromarray((silhouette * 255).astype(np.uint8), "L"))
+        damaged = clean.copy()
+        alpha = np.asarray(damaged.getchannel("A")).copy()
+        for center_x, center_y in ((62, 58), (91, 72), (119, 87), (71, 112), (105, 128), (132, 145)):
+            hole = (xx - center_x) ** 2 + (yy - center_y) ** 2 <= 11 ** 2
+            alpha[hole] = 0
+        damaged.putalpha(Image.fromarray(alpha, "L"))
+        self.assertGreater(app_module.cutout_quality(clean), 0.25)
+        self.assertLess(app_module.cutout_quality(damaged), 0.20)
 
 
 if __name__ == "__main__":

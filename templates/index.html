@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Crea un video verticale sincronizzato con la musica usando foto e clip.">
   <title>PetCut Studio</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='4') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='5') }}">
 </head>
 <body>
   <header class="site-header">
@@ -126,16 +126,17 @@
             <span>Durata</span>
             <select id="duration-select" name="duration">
               <option value="10">10 secondi</option>
-              <option value="15" selected>15 secondi</option>
-              <option value="24">24 secondi</option>
+              <option value="15">15 secondi</option>
+              <option value="24" selected>24 secondi · come il riferimento</option>
               <option value="30">30 secondi</option>
             </select>
+            <small class="field-help">Per la struttura completa usa una canzone di almeno 24 secondi.</small>
           </label>
 
           <label for="title-input">
             <span>Titolo <small>(facoltativo)</small></span>
             <input id="title-input" name="title" maxlength="64" autocomplete="off" placeholder="Es. CANE, LUNA, GATTO, MAX">
-            <small class="field-help">Separa con virgole fino a quattro nomi. Con un solo nome PetCut completa automaticamente le altre etichette.</small>
+            <small class="field-help">Separa con virgole fino a quattro nomi. Con un solo nome PetCut lo ripete nelle card.</small>
           </label>
         </div>
       </section>
@@ -190,6 +191,6 @@
     <span>Output verticale · MP4 · 30 fps</span>
   </footer>
 
-  <script src="{{ url_for('static', filename='app.js', v='4') }}"></script>
+  <script src="{{ url_for('static', filename='app.js', v='5') }}"></script>
 </body>
 </html>
