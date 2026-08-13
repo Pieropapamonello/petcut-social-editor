@@ -1,6 +1,8 @@
 const form = document.querySelector('#editor-form');
+const primaryInput = document.querySelector('#primary-input');
 const mediaInput = document.querySelector('#media-input');
 const audioInput = document.querySelector('#audio-input');
+const primarySummary = document.querySelector('#primary-summary');
 const mediaSummary = document.querySelector('#media-summary');
 const audioSummary = document.querySelector('#audio-summary');
 const durationSelect = document.querySelector('#duration-select');
@@ -40,10 +42,19 @@ function formatBytes(bytes) {
   return megabytes >= 1 ? `${megabytes.toFixed(megabytes >= 10 ? 0 : 1)} MB` : `${Math.ceil(bytes / 1024)} KB`;
 }
 
-function summarizeFiles(input, target, singular, plural) {
+function formatSeconds(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds)) return '—';
+  const rounded = Math.abs(seconds - Math.round(seconds)) < 0.04
+    ? String(Math.round(seconds))
+    : seconds.toFixed(1).replace('.', ',');
+  return `${rounded}s`;
+}
+
+function summarizeFiles(input, target, singular, plural, emptyMessage) {
   const files = [...input.files];
   if (!files.length) {
-    target.textContent = input === mediaInput ? 'Nessun contenuto selezionato.' : 'Nessuna canzone selezionata.';
+    target.textContent = emptyMessage;
     return;
   }
 
@@ -92,11 +103,18 @@ function showAnalysis(data) {
   visualCuts.textContent = data.visual_cuts ?? '—';
 
   const duration = Number(data.duration) || Number(durationSelect.value);
-  const durationLabel = Number.isInteger(duration) ? String(duration) : duration.toFixed(1).replace('.', ',');
+  const audioStart = Number(data.audio_start) || 0;
+  const audioEnd = Number.isFinite(Number(data.audio_end))
+    ? Number(data.audio_end)
+    : audioStart + duration;
+  const extractLabel = `Estratto: ${formatSeconds(duration)}, da ${formatSeconds(audioStart)} a ${formatSeconds(audioEnd)} del brano.`;
   const contents = data.recommended_content;
-  analysisNote.textContent = data.message || (contents
-    ? `Per ${durationLabel} secondi di musica sono consigliati circa ${contents} contenuti distinti. Se ne carichi uno solo, PetCut lo riutilizzerà con inquadrature e movimenti diversi.`
+  const detail = data.message || (contents
+    ? `Sono consigliati circa ${contents} ambienti distinti. Se ne carichi uno solo, PetCut creerà comunque inquadrature e movimenti diversi.`
     : 'La canzone è pronta per guidare il montaggio.');
+  analysisNote.textContent = detail.toLowerCase().includes('estratto')
+    ? detail
+    : `${extractLabel} ${detail}`;
   analysisNote.hidden = false;
 }
 
@@ -200,12 +218,16 @@ async function pollJob(jobId, startedAt) {
   }
 }
 
+primaryInput.addEventListener('change', () => {
+  summarizeFiles(primaryInput, primarySummary, 'protagonista', 'protagonisti', 'Nessun protagonista selezionato.');
+});
+
 mediaInput.addEventListener('change', () => {
-  summarizeFiles(mediaInput, mediaSummary, 'contenuto', 'contenuti');
+  summarizeFiles(mediaInput, mediaSummary, 'scena', 'scene', 'Nessuna scena aggiuntiva.');
 });
 
 audioInput.addEventListener('change', () => {
-  summarizeFiles(audioInput, audioSummary, 'canzone', 'canzoni');
+  summarizeFiles(audioInput, audioSummary, 'canzone', 'canzoni', 'Nessuna canzone selezionata.');
   analyzeSong();
 });
 
@@ -248,7 +270,10 @@ form.addEventListener('submit', async (event) => {
     const rhythm = job.edit_bpm && job.edit_bpm !== job.bpm
       ? `${job.bpm} BPM, montaggio a ${job.edit_bpm} BPM`
       : `${job.bpm || '—'} BPM`;
-    resultSummary.textContent = `Ritmo: ${rhythm}. Cambi visivi creati: ${job.scenes || '—'}.`;
+    const excerpt = Number.isFinite(Number(job.duration))
+      ? `Estratto: ${formatSeconds(job.duration)}, da ${formatSeconds(job.audio_start || 0)} a ${formatSeconds(job.audio_end ?? ((job.audio_start || 0) + job.duration))}. `
+      : '';
+    resultSummary.textContent = `${excerpt}Ritmo: ${rhythm}. Cambi visivi creati: ${job.scenes || '—'}.`;
     resultPanel.hidden = false;
     resultPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
     resultHeading.focus({ preventScroll: true });
@@ -267,5 +292,5 @@ newEditButton.addEventListener('click', () => {
   renderPanel.hidden = true;
   clearFormError();
   form.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  mediaInput.focus({ preventScroll: true });
+  primaryInput.focus({ preventScroll: true });
 });

@@ -121,7 +121,8 @@ class AudioAnalysisTests(unittest.TestCase):
         self.assertGreater(result["visual_cuts"], 20)
         self.assertEqual([phase["name"] for phase in result["phases"]], ["intro", "roulette", "frase", "climax"])
         self.assertIn("solo contenuto", result["note"])
-        self.assertIn("24 secondi", result["note"])
+        self.assertIn("Estratto scelto", result["note"])
+        self.assertIn("drop", result["note"])
 
 
 if __name__ == "__main__":

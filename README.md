@@ -1,8 +1,8 @@
 # PetCut Studio
 
-PetCut trasforma foto o video e una canzone in un montaggio verticale 9:16, esportato in MP4 a 576×1024 e 30 fps per Reels e TikTok.
+PetCut trasforma un protagonista, scene facoltative e una canzone in un montaggio verticale 9:16, esportato in MP4 a 576×1024 e 30 fps per Reels e TikTok.
 
-Il motore non applica un effetto casuale in modo uniforme: analizza BPM, transienti, intensità e punto di drop, poi costruisce una timeline diversa per ogni sezione del brano. I tagli sono quantizzati sui frame e agganciati agli onset più vicini. Anche un solo contenuto può essere riutilizzato con inquadrature, pose, crop e movimenti differenti.
+Il motore analizza l'intero brano, sceglie l'estratto con il drop nella stessa posizione narrativa del riferimento e costruisce una griglia di beat, mezzi beat, quarti e onset. Tutti i tagli e gli accenti derivano da quella griglia. Anche con una sola foto o clip, il soggetto resta riconoscibile e gli sfondi cambiano tramite livelli, parallax e movimenti 2.5D.
 
 ## Montaggio unico
 
@@ -11,11 +11,11 @@ PetCut produce un solo stile, ricostruito sul riferimento fornito:
 1. clip introduttive in movimento con nomi grandi;
 2. roulette di pose scontornate su nero;
 3. collage con la frase `CAN YOU IMAGINE FLOATING WEIGHTLESS`;
-4. climax full-frame con hard cut, whip, flash e zoom blur sul drop.
+4. climax con protagonista persistente, sfondi separati, parallax, prospettiva, whip e flash sugli attacchi reali.
 
-La durata consigliata è 24 secondi, come il riferimento. Se la canzone è più corta, PetCut adatta la cue sheet in battute e riduce automaticamente le card introduttive per lasciare leggibile la frase centrale. Le maschere con sfondo, bordi rettangolari o poco dettaglio vengono escluse prima del montaggio.
+La durata consigliata è 24 secondi, come il riferimento. Se la struttura musicale non permette un montaggio completo, PetCut accorcia l'estratto o degrada esplicitamente la cue sheet senza creare segmenti fuori ordine. Le maschere con sfondo, fori, bordi rettangolari o identità incoerente vengono escluse; un matte non affidabile interrompe il job invece di ripetere mobili o pavimento in tutto il video.
 
-Per creare i livelli, il soggetto viene individuato localmente con un modello ONNX incluso nel repository. Non vengono inviati file a servizi AI esterni. Le informazioni sul modello sono in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+Il primo upload è sempre il protagonista. Gli upload successivi sono soltanto scene o sfondi e non possono sostituirlo. Segmentazione, selezione dell'identità, rifinitura GrabCut, decontaminazione dei bordi e generazione dei livelli avvengono localmente; i file non vengono inviati a servizi AI esterni. Le informazioni sui modelli sono in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Avvio locale
 
@@ -42,7 +42,7 @@ python app.py
 
 ```bash
 python -m unittest discover -s tests -v
-python -m py_compile app.py audio_analysis.py render_engine.py
+python -m compileall -q .
 node --check static/app.js
 ```
 

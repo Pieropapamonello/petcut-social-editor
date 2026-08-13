@@ -8,9 +8,11 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import urllib.request
 import uuid
 import wave
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
@@ -25,7 +27,14 @@ from werkzeug.utils import secure_filename
 
 from audio_analysis import analyze_audio as analyze_audio_structure
 from audio_analysis import recommendation as audio_recommendation
+from edit_timeline import build_edit_timeline
 from render_engine import render_preset
+from subject_pipeline import (
+    SubjectCandidate,
+    matte_diagnostics,
+    refine_cutout,
+    select_identity_cohort,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", BASE_DIR / "data" / "exports"))
@@ -44,6 +53,9 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 JOBS = {}
 RENDER_QUEUE = ThreadPoolExecutor(max_workers=1)
+AUDIO_ANALYSIS_LOCK = threading.Lock()
+AUDIO_ANALYSIS_CACHE: OrderedDict[str, dict] = OrderedDict()
+AUDIO_ANALYSIS_CACHE_SIZE = 8
 SUBJECT_NET = None
 SUBJECT_NET_FAILED = False
 SUBJECT_NET_LOCK = threading.Lock()
@@ -68,6 +80,10 @@ INSTANCE_MODEL = MODEL_DIR / "yolov8n-seg.onnx"
 INSTANCE_CLASSES = {0, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23}
 
 
+class SubjectIsolationError(RuntimeError):
+    """The upload cannot produce a trustworthy persistent foreground."""
+
+
 def extension_allowed(filename, allowed):
     return "." in filename and filename.rsplit(".", 1)[1].lower() in allowed
 
@@ -79,6 +95,36 @@ def requested_duration() -> int:
     except (TypeError, ValueError):
         abort(400, "Durata non valida.")
     return min(60, max(5, value))
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def analyze_audio_cached(path: Path) -> dict:
+    """Analyse identical preview/render uploads only once.
+
+    The cache retains compact analysis dictionaries, never the user's audio.
+    Serialising misses also prevents two FFT passes competing on the smallest
+    Render plan when the preview and final request arrive close together.
+    """
+
+    cache_key = _file_sha256(Path(path))
+    with AUDIO_ANALYSIS_LOCK:
+        cached = AUDIO_ANALYSIS_CACHE.get(cache_key)
+        if cached is not None:
+            AUDIO_ANALYSIS_CACHE.move_to_end(cache_key)
+            return json.loads(json.dumps(cached))
+        result = analyze_audio_structure(Path(path), 0.0)
+        AUDIO_ANALYSIS_CACHE[cache_key] = json.loads(json.dumps(result))
+        AUDIO_ANALYSIS_CACHE.move_to_end(cache_key)
+        while len(AUDIO_ANALYSIS_CACHE) > AUDIO_ANALYSIS_CACHE_SIZE:
+            AUDIO_ANALYSIS_CACHE.popitem(last=False)
+        return json.loads(json.dumps(result))
 
 
 def run(command):
@@ -325,9 +371,10 @@ def instance_subject_mask(rgb: np.ndarray) -> tuple[np.ndarray | None, tuple[int
     """Return the single main person/animal instance and its tight box.
 
     Unioning every detection looked disastrous when a dog sat beside a
-    person: trousers, furniture and the animal became one cutout. Animal
-    instances are preferred when present; otherwise the most central,
-    confident person is used.
+    person: trousers, furniture and the animal became one cutout.  Selection
+    therefore follows the most prominent central instance.  An animal gets a
+    small tie-break bonus, but can no longer displace a large central person
+    merely because it belongs to an animal class.
     """
     session = instance_segmenter()
     if session is None:
@@ -363,28 +410,26 @@ def instance_subject_mask(rgb: np.ndarray) -> tuple[np.ndarray | None, tuple[int
             return None, None
 
         selected_indices = np.asarray(selected).reshape(-1).astype(int).tolist()
-        animal_indices = [
-            selected_index
-            for selected_index in selected_indices
-            if int(class_ids[candidates[selected_index]]) != 0
-        ]
-        primary_pool = animal_indices or selected_indices
-
         def primary_score(selected_index: int) -> float:
             candidate = int(candidates[selected_index])
             box_x, box_y, box_width, box_height = boxes[selected_index]
             center_x = box_x + box_width / 2
             center_y = box_y + box_height / 2
-            centrality = max(
-                0.0,
-                1.0
-                - abs(center_x - size / 2) / (size / 2)
-                - abs(center_y - size / 2) / (size / 2),
+            centre_distance = math.hypot(
+                (center_x - size / 2) / (size / 2),
+                (center_y - size / 2) / (size / 2),
             )
+            centrality = max(0.0, 1.0 - centre_distance / math.sqrt(2.0))
             area = min(1.0, max(0.0, box_width * box_height / (size * size * 0.45)))
-            return float(confidences[candidate]) * 0.64 + centrality * 0.22 + area * 0.14
+            animal_bonus = 0.04 if int(class_ids[candidate]) != 0 else 0.0
+            return (
+                float(confidences[candidate]) * 0.46
+                + centrality * 0.31
+                + area * 0.23
+                + animal_bonus * min(1.0, area * 1.5)
+            )
 
-        selected_index = max(primary_pool, key=primary_score)
+        selected_index = max(selected_indices, key=primary_score)
         candidate = int(candidates[selected_index])
         proto_height, proto_width = prototype.shape[1:]
         xx = np.arange(proto_width)[None, :]
@@ -523,17 +568,24 @@ def isolate_subject(frame: Image.Image, motion: np.ndarray | None = None, stabil
         # Avoid retaining YOLOv8's native inference workspace while U2NetP
         # and GrabCut are active; this is important on 512 MB Render workers.
         release_instance_after_miss()
-        # Do not stack two more neural networks after an instance miss. The
-        # conservative centre box below feeds the existing colour-aware
-        # GrabCut fallback and stays well within Render Free's memory limit.
+        # Run the lightweight salient-object model only after the instance
+        # session has been released. This keeps peak memory bounded while
+        # giving GrabCut a real subject-shaped trimap instead of a rectangle.
+        saliency = neural_saliency(rgb)
         fallback_box = (
             int(width * 0.12),
             int(height * 0.08),
             int(width * 0.76),
             int(height * 0.86),
         )
-        x, y, box_width, box_height = subject_box or fallback_box
+        saliency_box = None
+        if saliency is not None:
+            points = cv2.findNonZero((saliency > 0.20).astype(np.uint8))
+            if points is not None:
+                saliency_box = cv2.boundingRect(points)
+        x, y, box_width, box_height = subject_box or saliency_box or fallback_box
     else:
+        saliency = instance_probability
         x, y, box_width, box_height = instance_box or subject_box or detect_subject(rgb)
     x, y = max(0, x), max(0, y)
     box_width = max(2, min(width - x, box_width))
@@ -550,45 +602,6 @@ def isolate_subject(frame: Image.Image, motion: np.ndarray | None = None, stabil
     face_zone = ((xx - center_x) / max(2, box_width * 0.23)) ** 2 + ((yy - (y + box_height * 0.30)) / max(2, box_height * 0.23)) ** 2 < 1
     protected_zone = ((xx - center_x) / max(2, box_width * 0.38)) ** 2 + ((yy - center_y) / max(2, box_height * 0.54)) ** 2 < 1
     border = (xx < width * 0.035) | (xx > width * 0.965) | (yy < height * 0.025) | (yy > height * 0.975)
-    saliency = instance_probability
-
-    if instance_probability is not None:
-        # Instance masks are much cleaner around rugs, furniture and floors
-        # than a generic salient-object ellipse. Preserve a soft 2-pixel edge
-        # while keeping the learned mask itself authoritative.
-        # Keep the learned matte inside the detected instance.  The former
-        # low threshold retained a coloured fringe of rugs, walls and beds;
-        # that fringe became especially obvious against the pure-black
-        # roulette background.
-        alpha = np.clip((instance_probability - 0.30) / 0.46, 0, 1)
-        alpha = (alpha * 255).astype(np.uint8)
-        lab_instance = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
-        instance_lightness, instance_a, instance_b = cv2.split(lab_instance)
-        instance_chroma = np.sqrt((instance_a - 128) ** 2 + (instance_b - 128) ** 2)
-        confident = alpha > 210
-        if np.any(confident) and float(np.median(instance_chroma[confident])) < 16 and float(np.median(instance_lightness[confident])) < 72:
-            coloured_background = (instance_chroma > 19) & (instance_lightness > 28) & ~face_zone
-            alpha[coloured_background] = 0
-        # Preserve fur detail but avoid the light fringe produced by dilating
-        # the learned mask into the original background.
-        alpha = cv2.GaussianBlur(alpha, (3, 3), 0)
-        foreground_pixels = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)[alpha > 127]
-        if foreground_pixels.size and float(np.median(foreground_pixels)) < 95:
-            # Lift luminance in Lab space so black fur stays coloured and its
-            # texture remains visible against the roulette's black canvas.
-            # A linear lift barely changed near-black pixels; the adaptive
-            # curve targets those shadows without clipping eyes/highlights.
-            median_luma = float(np.median(foreground_pixels))
-            gamma = 0.48 if median_luma < 45 else 0.68
-            lab_enhanced = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-            light = lab_enhanced[:, :, 0].astype(np.float32) / 255.0
-            lab_enhanced[:, :, 0] = np.clip(np.power(light, gamma) * 198 + 50, 0, 255).astype(np.uint8)
-            enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
-            blurred = cv2.GaussianBlur(enhanced, (0, 0), 0.75)
-            enhanced = cv2.addWeighted(enhanced, 1.38, blurred, -0.38, 0)
-            rgb = np.where((alpha > 0)[:, :, None], enhanced, rgb)
-        return Image.fromarray(np.dstack((rgb, alpha)), "RGBA")
-
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
     lightness, channel_a, channel_b = cv2.split(lab)
     seed_zone = core if saliency is None else core & (saliency > 0.52)
@@ -628,7 +641,10 @@ def isolate_subject(frame: Image.Image, motion: np.ndarray | None = None, stabil
     # furniture or floor. Apply this only for that conservative case so people
     # and coloured animals keep their clothes/fur.
     if float(foreground_median[0]) < 62 and float(np.median(chroma[foreground_seeds])) < 18:
-        coloured_background = (chroma > 16) & (lightness > 28) & ~face_zone
+        # A large protected face ellipse kept the red rug/cabinet connected
+        # to this black dog's ears.  Protect only the high-confidence core:
+        # saturated, brighter pixels around it are background, not dark fur.
+        coloured_background = (chroma > 22) & (lightness > 55) & ~core
         lower_light_background = (yy > y + box_height * 0.62) & (lightness > 92) & (chroma < 13)
         mask[coloured_background | lower_light_background] = cv2.GC_BGD
 
@@ -751,47 +767,130 @@ def cutout_quality(subject: Image.Image) -> float:
     return float(max(0.0, min(1.0, score)))
 
 
+def _lift_subject_detail(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """Reveal dark fur/clothes without brightening the transparent fringe."""
+
+    image = np.asarray(rgb, dtype=np.uint8)
+    matte = np.asarray(alpha, dtype=np.uint8)
+    confident = matte >= 150
+    if not np.any(confident):
+        return image.copy()
+    gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    median = float(np.median(gray[confident]))
+    if median >= 92:
+        return image.copy()
+    lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
+    lightness = lab[:, :, 0].astype(np.float32) / 255.0
+    gamma = 0.55 if median < 45 else 0.72
+    lifted = np.clip(np.power(lightness, gamma) * 185.0 + 32.0, 0, 238).astype(np.uint8)
+    lab[:, :, 0] = lifted
+    enhanced = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+    detail = cv2.GaussianBlur(enhanced, (0, 0), 0.72)
+    enhanced = cv2.addWeighted(enhanced, 1.30, detail, -0.30, 0)
+    # Use only confident matte pixels at full strength.  A soft transition on
+    # the inner edge keeps hair natural without resurrecting its old backdrop.
+    weight = np.clip((matte.astype(np.float32) - 48.0) / 160.0, 0.0, 1.0)[..., None]
+    return np.rint(image * (1.0 - weight) + enhanced * weight).clip(0, 255).astype(np.uint8)
+
+
 def create_cutouts(paths: list[Path], job_dir: Path, count: int) -> tuple[list[Path], list[Path]]:
-    samples, records = [], []
-    for index in range(count):
-        source = paths[index % len(paths)]
-        frame = source_frame(source, index // len(paths), max(1, math.ceil(count / len(paths))))
-        sample = job_dir / f"sample-{index:02d}-source-{index % len(paths):02d}.jpg"
-        frame.convert("RGB").save(sample, quality=94)
-        samples.append(sample)
-        records.append((source, frame))
+    """Extract coherent views of the first upload, the declared protagonist."""
+    if not paths:
+        raise ValueError("Nessun soggetto principale disponibile")
+    source = Path(paths[0])
+    total = max(1, int(count))
+    candidates: list[SubjectCandidate] = []
+    records: list[dict] = []
 
-    candidates: list[tuple[float, Path, Path]] = []
-    for index, (source, frame) in enumerate(records):
-        # Frames sampled seconds apart often belong to different shots.  A
-        # temporal median across those shots marks the whole changed room as
-        # foreground, so segmentation must be evaluated independently.
-        result = isolate_subject(frame)
-        quality = cutout_quality(result)
-        bounds = result.getchannel("A").getbbox()
+    for index in range(total):
+        # Extra uploads are scenery only. Sampling one declared source also
+        # prevents the identity selector from silently switching animal/person.
+        frame = source_frame(source, index, total).convert("RGB")
+        sample = job_dir / f"sample-{index:02d}-source-00.jpg"
+        frame.save(sample, quality=94)
+        rgb = np.asarray(frame, dtype=np.uint8)
+
+        coarse = isolate_subject(frame).convert("RGBA")
+        coarse_alpha = np.asarray(coarse.getchannel("A"), dtype=np.uint8)
+        coarse_bounds = Image.fromarray(coarse_alpha, "L").getbbox()
+        coarse_bbox = None
+        if coarse_bounds:
+            coarse_bbox = (
+                coarse_bounds[0],
+                coarse_bounds[1],
+                coarse_bounds[2] - coarse_bounds[0],
+                coarse_bounds[3] - coarse_bounds[1],
+            )
+
+        clean_rgb, alpha, diagnostics = refine_cutout(rgb, coarse_alpha, coarse_bbox)
+        if "background-rectangle" in diagnostics.reasons or "empty" in diagnostics.reasons:
+            # Never convert an invalid detector rectangle into an ellipse: it
+            # would preserve carpet/wall pixels and repeat them in every shot.
+            clean_rgb = rgb
+            alpha = np.zeros_like(coarse_alpha)
+            diagnostics = matte_diagnostics(alpha)
+
+        clean_rgb = _lift_subject_detail(clean_rgb, alpha)
+
+        alpha_sidecar = sample.with_name(f"{sample.stem}-alpha.png")
+        Image.fromarray(alpha, "L").save(alpha_sidecar)
+
+        rgba = Image.fromarray(np.dstack((clean_rgb, alpha)), "RGBA")
+        bounds = rgba.getchannel("A").getbbox()
         if bounds:
-            result = result.crop(bounds)
-        result.thumbnail((520, 820), Image.Resampling.LANCZOS)
+            rgba = rgba.crop(bounds)
+        rgba.thumbnail((520, 820), Image.Resampling.LANCZOS)
         destination = job_dir / f"cutout-{index}.png"
-        result.save(destination)
-        candidates.append((quality, destination, samples[index]))
+        rgba.save(destination)
 
-    # Reject obvious rectangular/background mattes while remaining useful
-    # when the upload contains only people or a single difficult frame.  The
-    # renderer can safely reuse a clean pose; one broken matte is far more
-    # noticeable than a repeated clean one.
-    ranked = sorted(candidates, key=lambda item: item[0], reverse=True)
-    best = ranked[0][0] if ranked else 0.0
-    selected = [item for item in candidates if item[0] >= max(0.30, best - 0.12)]
-    minimum = min(len(ranked), 1)
-    if len(selected) < minimum:
-        selected_paths = {path for _, path, _ in selected}
-        selected.extend(item for item in ranked if item[1] not in selected_paths and len(selected) < minimum)
-    if not selected:
-        selected = ranked[:1]
-    cutouts = [path for _, path, _ in selected]
-    selected_samples = [sample for _, _, sample in selected]
-    return cutouts, selected_samples
+        # Identity descriptors do not need full-resolution frames. Bounding
+        # them here saves tens of megabytes on a 12-pose video job.
+        preview_scale = min(1.0, 360.0 / max(rgb.shape[:2]))
+        preview_size = (
+            max(8, round(rgb.shape[1] * preview_scale)),
+            max(8, round(rgb.shape[0] * preview_scale)),
+        )
+        preview_rgb = cv2.resize(rgb, preview_size, interpolation=cv2.INTER_AREA)
+        preview_alpha = cv2.resize(alpha, preview_size, interpolation=cv2.INTER_AREA)
+        candidates.append(
+            SubjectCandidate(
+                rgb=preview_rgb,
+                alpha=preview_alpha,
+                source_index=0,
+                confidence=max(0.0, min(1.0, diagnostics.quality)),
+                candidate_id=index,
+            )
+        )
+        records.append(
+            {
+                "cutout": destination,
+                "sample": sample,
+                "diagnostics": diagnostics,
+            }
+        )
+
+    cohort = select_identity_cohort(candidates)
+    valid_members = [
+        index
+        for index in cohort.member_indices
+        if records[index]["diagnostics"].passes
+        and "background-rectangle" not in records[index]["diagnostics"].reasons
+    ]
+    ordered: list[int] = []
+    if cohort.anchor_index in valid_members:
+        ordered.append(int(cohort.anchor_index))
+    ordered.extend(index for index in valid_members if index not in ordered)
+
+    if not ordered:
+        raise SubjectIsolationError(
+            "Non riesco a separare con precisione il protagonista dallo sfondo. "
+            "Prova un'inquadratura più nitida, con il soggetto intero e ben distinto."
+        )
+
+    return (
+        [records[index]["cutout"] for index in ordered],
+        [records[index]["sample"] for index in ordered],
+    )
 
 
 def split_title_words(_title: str) -> list[str]:
@@ -1002,6 +1101,43 @@ def keep_only_output(job_dir: Path, destination: Path | None = None):
             path.unlink(missing_ok=True)
 
 
+def cleanup_completed_jobs(max_jobs: int = 8, max_age_seconds: int = 24 * 60 * 60) -> None:
+    """Bound PetCut's ephemeral export directory without touching active jobs."""
+
+    root = (OUTPUT_DIR / "jobs").resolve()
+    if not root.is_dir():
+        return
+    now = time.time()
+    completed: list[tuple[float, Path]] = []
+    stale_incomplete: list[Path] = []
+    for candidate in root.iterdir():
+        if not candidate.is_dir():
+            continue
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(root)
+            modified = candidate.stat().st_mtime
+        except (OSError, ValueError):
+            continue
+        if (candidate / "job.json").is_file():
+            completed.append((modified, candidate))
+        elif now - modified > 2 * 60 * 60:
+            stale_incomplete.append(candidate)
+    completed.sort(key=lambda item: item[0], reverse=True)
+    removable = [
+        path
+        for index, (modified, path) in enumerate(completed)
+        if index >= max(1, int(max_jobs)) or now - modified > max_age_seconds
+    ]
+    for candidate in [*stale_incomplete, *removable]:
+        try:
+            resolved = candidate.resolve()
+            resolved.relative_to(root)
+        except (OSError, ValueError):
+            continue
+        shutil.rmtree(resolved, ignore_errors=True)
+
+
 @app.get("/")
 def index():
     return render_template("index.html", max_upload_mb=MAX_UPLOAD_MB)
@@ -1015,7 +1151,7 @@ def health():
         output=f"{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}",
         fps=30,
         mode=REFERENCE_STYLE,
-        profile="reference-match-v5",
+        profile="subject-sync-3d-v1",
     )
 
 
@@ -1028,14 +1164,35 @@ def analyze_audio():
     with tempfile.TemporaryDirectory(prefix="petcut-analysis-") as temp:
         path = Path(temp) / f"audio.{secure_filename(audio.filename).rsplit('.', 1)[1]}"
         audio.save(path)
-        rhythm = analyze_audio_structure(path, requested_seconds)
-    plan = audio_recommendation(REFERENCE_STYLE, rhythm["duration"], rhythm)
+        # Analyse the complete track (bounded to 180 s inside the analyser),
+        # then choose the best frame-exact excerpt for the requested maximum.
+        rhythm = analyze_audio_cached(path)
+    timeline = build_edit_timeline(rhythm, float(requested_seconds))
+    window = timeline["window"]
+    plan = audio_recommendation(REFERENCE_STYLE, float(requested_seconds), rhythm)
+    local_sections = []
+    for section in rhythm.get("sections", []):
+        source_start = max(float(window["start"]), float(section.get("start", 0.0)))
+        source_end = min(float(window["end"]), float(section.get("end", window["end"])))
+        if source_end <= source_start:
+            continue
+        local_sections.append(
+            {
+                **section,
+                "start": round(source_start - float(window["start"]), 6),
+                "end": round(source_end - float(window["start"]), 6),
+            }
+        )
     return jsonify(
         bpm=rhythm["bpm"],
         edit_bpm=rhythm["edit_bpm"],
-        duration=rhythm["duration"],
-        drop_time=rhythm["drop_time"],
-        sections=rhythm["sections"],
+        duration=window["duration"],
+        audio_duration=window["source_duration"],
+        audio_start=window["start"],
+        audio_end=window["end"],
+        drop_time=window["visual_drop"],
+        source_drop=window["source_visual_drop"],
+        sections=local_sections,
         phases=plan["phases"],
         recommended_content=plan["ideal_media"],
         minimum_content=plan["min_media"],
@@ -1047,17 +1204,18 @@ def analyze_audio():
 def render_job(job_id, paths, audio_path, title, requested_seconds, job_dir):
     try:
         JOBS[job_id].update(progress=3, stage=0, phase="Analisi del ritmo e delle sezioni musicali")
-        rhythm = analyze_audio_structure(audio_path, float(requested_seconds))
-        duration = min(float(requested_seconds), float(rhythm["duration"]))
+        rhythm = analyze_audio_cached(audio_path)
+        timeline = build_edit_timeline(rhythm, float(requested_seconds))
+        window = timeline["window"]
         JOBS[job_id].update(progress=10, stage=1, phase="Selezione delle inquadrature migliori")
 
         # The only edit uses layered subjects throughout its first three acts.
-        # Twelve temporal samples preserve pose variety even with one source.
-        has_video = any(Path(path).suffix.lower().lstrip(".") in ALLOWED_VIDEO for path in paths)
+        # Eight temporal samples preserve pose variety while keeping sequential
+        # segmentation within the CPU/RAM budget of the smallest Render plan.
+        has_video = Path(paths[0]).suffix.lower().lstrip(".") in ALLOWED_VIDEO
         # A still image yields the same matte on every pass; reuse it through
-        # transforms in the renderer instead of running segmentation eight
-        # times. Videos still supply twelve genuinely different poses.
-        cutout_count = 12 if has_video else max(1, min(12, len(paths)))
+        # transforms in the renderer instead of repeating segmentation.
+        cutout_count = 8 if has_video else 1
         try:
             cutouts, samples = create_cutouts(paths, job_dir, cutout_count)
         finally:
@@ -1077,13 +1235,16 @@ def render_job(job_id, paths, audio_path, title, requested_seconds, job_dir):
             audio_path,
             job_dir,
             destination,
-            duration,
+            float(requested_seconds),
             rhythm,
             title,
             cutouts=cutouts,
             samples=samples,
             progress=update_progress,
         )
+        output_duration = float(metadata.get("duration", window["duration"]))
+        audio_start = float(metadata.get("audio_start", window["start"]))
+        audio_end = float(metadata.get("audio_end", audio_start + output_duration))
         JOBS[job_id].update(
             status="complete",
             output=str(destination),
@@ -1092,7 +1253,14 @@ def render_job(job_id, paths, audio_path, title, requested_seconds, job_dir):
             phase="Video completato",
             bpm=rhythm["bpm"],
             edit_bpm=rhythm["edit_bpm"],
-            drop_time=metadata.get("drop_time", rhythm["drop_time"]),
+            duration=output_duration,
+            audio_start=audio_start,
+            audio_end=audio_end,
+            source_drop=metadata.get(
+                "source_drop_time",
+                metadata.get("source_drop", window["source_visual_drop"]),
+            ),
+            drop_time=metadata.get("drop_time", window["visual_drop"]),
             mode=REFERENCE_STYLE,
             scenes=metadata["scenes"],
         )
@@ -1105,13 +1273,27 @@ def render_job(job_id, paths, audio_path, title, requested_seconds, job_dir):
         app.logger.exception("Render failed")
         if isinstance(error, subprocess.CalledProcessError):
             app.logger.error(error.stderr)
-        JOBS[job_id].update(status="failed", phase="Montaggio interrotto", error="Generazione non riuscita. Prova con file più brevi o riprova tra poco.")
+        public_error = (
+            str(error)
+            if isinstance(error, SubjectIsolationError)
+            else "Generazione non riuscita. Prova con file più brevi o riprova tra poco."
+        )
+        JOBS[job_id].update(
+            status="failed",
+            phase="Montaggio interrotto",
+            error=public_error,
+        )
         keep_only_output(job_dir)
 
 
 @app.post("/api/render")
 def render_video():
-    media, audio = [file for file in request.files.getlist("media") if file and file.filename], request.files.get("audio")
+    primary = request.files.get("primary")
+    extras = [file for file in request.files.getlist("media") if file and file.filename]
+    # Keep the old multipart contract working for clients opened before this
+    # release, while the new UI makes the protagonist explicit.
+    media = ([primary] if primary and primary.filename else []) + extras
+    audio = request.files.get("audio")
     title = request.form.get("title", "").strip()[:64]
     requested_seconds = requested_duration()
     if not media or not audio:
@@ -1120,6 +1302,7 @@ def render_video():
         abort(400, "Formato non supportato.")
     if len(media) > 30:
         abort(400, "Puoi caricare al massimo 30 foto o video per montaggio.")
+    cleanup_completed_jobs()
     job_id, job_dir = uuid.uuid4().hex, OUTPUT_DIR / "jobs" / uuid.uuid4().hex
     job_dir.mkdir(parents=True, exist_ok=True)
     audio_path = job_dir / f"audio.{secure_filename(audio.filename).rsplit('.', 1)[1]}"

@@ -18,6 +18,9 @@ import cv2
 import numpy as np
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
+from edit_timeline import build_edit_timeline
+from layered_effects import BACKGROUND_NAMES, LayeredAssets, prepare_layered_assets, render_layered_board
+
 
 WIDTH, HEIGHT, FPS = 576, 1024, 30
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
@@ -399,11 +402,19 @@ def _source_assets(paths: Sequence[Path], samples: Sequence[Path] | None, job_di
         for group in video_groups
         if index < len(group)
     ]
-    # Samples supplied by the old app are preferred; otherwise create a few
-    # reusable full-frame stills from the scored video moments.
-    if not images:
-        for index, (path, time_value) in enumerate(video_times[:8]):
-            images.append(_extract_frame(path, time_value, job_dir / f"engine-source-{index:02d}.jpg"))
+    # Keep a small scene pool even when subject samples already exist.  The
+    # previous code skipped this branch as soon as one cutout sample was
+    # present, leaving the whole climax with a single repeated background.
+    # These frames are backgrounds only; identity always comes from paths[0].
+    for index, (path, time_value) in enumerate(video_times[:8]):
+        source_index = next((item for item, value in enumerate(paths) if Path(value) == path), 0)
+        images.append(
+            _extract_frame(
+                path,
+                time_value,
+                job_dir / f"engine-background-{index:02d}-source-{source_index:02d}.jpg",
+            )
+        )
     return images, video_times
 
 
@@ -526,13 +537,11 @@ def _still_clip(image_path: Path, destination: Path, duration: float, mode: str,
         ])
     if impact:
         filters.extend([
-            "gblur=sigma=7:enable='lt(n,2)'",
-            "drawbox=color=white@0.82:t=fill:enable='eq(n,0)'",
-            "drawbox=color=white@0.66:t=fill:enable='eq(n,1)'",
-            "drawbox=color=white@0.49:t=fill:enable='eq(n,2)'",
-            "drawbox=color=white@0.32:t=fill:enable='eq(n,3)'",
-            "drawbox=color=white@0.17:t=fill:enable='eq(n,4)'",
-            "drawbox=color=white@0.07:t=fill:enable='eq(n,5)'",
+            "eq=contrast=1.18:saturation=1.24",
+            "gblur=sigma=10:enable='lt(n,2)'",
+            "drawbox=color=white@0.94:t=fill:enable='eq(n,0)'",
+            "drawbox=color=white@0.58:t=fill:enable='eq(n,1)'",
+            "drawbox=color=white@0.22:t=fill:enable='eq(n,2)'",
         ])
     elif accent:
         filters.extend([
@@ -629,7 +638,102 @@ def _intro_video_clip(
     ])
 
 
-def _finish(clips: Sequence[Path], audio_path: Path, destination: Path, duration: float, job_dir: Path) -> None:
+def _layered_clip(
+    background: Path,
+    subject_layer: Path,
+    contact_shadow: Path,
+    destination: Path,
+    duration: float,
+    mode: str,
+    accent: float = 0.0,
+    index: int = 0,
+) -> None:
+    """Animate plate, shadow and persistent protagonist as separate layers.
+
+    The movement is deliberately differential: the background travels more
+    than the foreground while the shadow lags behind it.  This creates depth
+    without running a generative model or flattening the scene into a single
+    JPEG.  Every accent is supplied by the musical cue sheet; this function
+    never invents a periodic flash of its own.
+    """
+
+    frames = max(1, round(float(duration) * FPS))
+    last = max(1, frames - 1)
+    accent_value = max(0.0, min(1.0, float(accent)))
+    direction = -1 if index % 2 else 1
+    phase = (index * 0.73) % (2 * math.pi)
+    strong_motion = mode in {"whip", "impact", "tunnel"}
+    # Concentrate optical energy after the drop.  The background travels much
+    # farther than the still-recognisable protagonist, producing true parallax
+    # instead of a nearly static sticker over a plate.
+    background_x = 52 if strong_motion else 38
+    background_y = 38 if strong_motion else 27
+    subject_x = 19 if strong_motion else 13
+    subject_y = 14 if strong_motion else 10
+    tilt = 0.024 if strong_motion else 0.015
+    subject_scale = 1.075 + 0.035 * accent_value if strong_motion else 1.045 + 0.025 * accent_value
+    scaled_width = max(WIDTH, round(WIDTH * subject_scale))
+    scaled_height = max(HEIGHT, round(HEIGHT * subject_scale))
+    shadow_width = max(WIDTH, round(WIDTH * (subject_scale * 0.985)))
+    shadow_height = max(HEIGHT, round(HEIGHT * (subject_scale * 0.985)))
+    # RGB ghosts are an impact effect, not a permanent outline.  Keeping a
+    # coloured split on clean shots made a good matte look like a cyan halo.
+    red_alpha = 0.18 * accent_value
+    blue_alpha = 0.18 * accent_value
+    split = round(11 * accent_value)
+
+    filters = (
+        f"[0:v]scale=648:1152:flags=bicubic,"
+        f"crop={WIDTH}:{HEIGHT}:"
+        f"x='(iw-ow)/2+{direction}*{background_x}*sin(PI*n/{last}+{phase:.4f})':"
+        f"y='(ih-oh)/2+{background_y}*cos(PI*n/{last}+{phase:.4f})',"
+        "eq=contrast=1.08:saturation=1.16[bg];"
+        f"[2:v]format=rgba,scale={shadow_width}:{shadow_height}:flags=bicubic,"
+        f"crop={WIDTH}:{HEIGHT}:x='(iw-ow)/2-{direction}*3*sin(PI*n/{last})':"
+        f"y='(ih-oh)/2+3*cos(PI*n/{last})'[shadow];"
+        f"[1:v]format=rgba,scale={scaled_width}:{scaled_height}:flags=lanczos,"
+        f"crop={WIDTH}:{HEIGHT}:x='(iw-ow)/2-{direction}*{subject_x}*sin(PI*n/{last})':"
+        f"y='(ih-oh)/2-{subject_y}*sin(PI*n/{last})',"
+        f"rotate='{direction}*{tilt:.5f}*sin(2*PI*t/{max(duration, 1 / FPS):.6f})':"
+        "ow=iw:oh=ih:c=0x00000000,format=rgba[subject];"
+        "[bg][shadow]overlay=0:0:format=auto[depth];"
+        "[subject]split=3[clean][redsource][bluesource];"
+        f"[redsource]colorchannelmixer=rr=1:rg=0:rb=0:gr=0:gg=0:gb=0:br=0:bg=0:bb=0:aa={red_alpha:.4f}[red];"
+        f"[bluesource]colorchannelmixer=rr=0:rg=0:rb=0:gr=0:gg=0:gb=0:br=0:bg=0:bb=1:aa={blue_alpha:.4f}[blue];"
+        f"[depth][red]overlay=x=-{split}:y=0:format=auto[redmix];"
+        f"[redmix][blue]overlay=x={split}:y=0:format=auto[splitmix];"
+        "[splitmix][clean]overlay=0:0:format=auto,"
+        "unsharp=5:5:0.82:5:5:0.0"
+    )
+    if accent_value >= 0.35:
+        first_alpha = 0.22 + 0.28 * accent_value
+        second_alpha = 0.08 + 0.12 * accent_value
+        filters += (
+            f",drawbox=color=white@{first_alpha:.3f}:t=fill:enable='eq(n,0)'"
+            f",drawbox=color=white@{second_alpha:.3f}:t=fill:enable='eq(n,1)'"
+        )
+    filters += ",format=yuv420p[out]"
+
+    _run([
+        "ffmpeg", "-y", "-v", "error",
+        "-loop", "1", "-framerate", FPS, "-i", background,
+        "-loop", "1", "-framerate", FPS, "-i", subject_layer,
+        "-loop", "1", "-framerate", FPS, "-i", contact_shadow,
+        "-frames:v", frames, "-filter_complex", filters, "-map", "[out]", "-an",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "21", "-threads", "1",
+        "-pix_fmt", "yuv420p", "-r", FPS, "-g", 15, "-keyint_min", 1,
+        "-sc_threshold", 0, destination,
+    ])
+
+
+def _finish(
+    clips: Sequence[Path],
+    audio_path: Path,
+    destination: Path,
+    duration: float,
+    job_dir: Path,
+    audio_start: float = 0.0,
+) -> None:
     if not clips:
         raise ValueError("No clips were rendered")
     concat_path = job_dir / "engine-clips.txt"
@@ -644,18 +748,28 @@ def _finish(clips: Sequence[Path], audio_path: Path, destination: Path, duration
         "-pix_fmt", "yuv420p", "-r", FPS, "-color_range", "tv", "-colorspace", "bt709",
         "-color_primaries", "bt709", "-color_trc", "bt709", "-x264-params",
         "colorprim=bt709:transfer=bt709:colormatrix=bt709:range=limited",
+        "-af", f"atrim=start={max(0.0, audio_start):.6f}:duration={duration:.6f},asetpts=PTS-STARTPTS",
         "-c:a", "aac", "-b:a", "192k",
         "-ar", "44100", "-movflags", "+faststart", destination,
     ])
 
 
 class _Timeline:
-    def __init__(self, job_dir: Path, audio_path: Path, destination: Path, duration: float, progress: Progress | None):
+    def __init__(
+        self,
+        job_dir: Path,
+        audio_path: Path,
+        destination: Path,
+        duration: float,
+        progress: Progress | None,
+        audio_start: float = 0.0,
+    ):
         self.job_dir = job_dir
         self.audio_path = audio_path
         self.destination = destination
         self.duration = duration
         self.progress = progress
+        self.audio_start = max(0.0, float(audio_start))
         self.clips: list[Path] = []
 
     def path(self) -> Path:
@@ -676,9 +790,37 @@ class _Timeline:
         _intro_video_clip(source, overlay, target, start, clip_duration)
         self.clips.append(target)
 
+    def add_layered(
+        self,
+        assets: LayeredAssets,
+        background: Path,
+        clip_duration: float,
+        mode: str,
+        accent: float = 0.0,
+    ) -> None:
+        target = self.path()
+        _layered_clip(
+            background,
+            assets.subject_layer,
+            assets.contact_shadow,
+            target,
+            clip_duration,
+            mode,
+            accent,
+            len(self.clips),
+        )
+        self.clips.append(target)
+
     def finish(self) -> None:
         _notify(self.progress, "finalizzazione", 94)
-        _finish(self.clips, self.audio_path, self.destination, self.duration, self.job_dir)
+        _finish(
+            self.clips,
+            self.audio_path,
+            self.destination,
+            self.duration,
+            self.job_dir,
+            self.audio_start,
+        )
 
 
 def _raw_board(
@@ -777,162 +919,375 @@ def _intro_asset_groups(
     return list(groups.items())
 
 
+def _frame_intervals(
+    frames: Sequence[int],
+    start: int,
+    end: int,
+    *,
+    minimum: int = 1,
+    maximum_intervals: int | None = None,
+) -> list[tuple[int, int]]:
+    """Return positive, frame-exact intervals without introducing new cuts."""
+
+    start, end = int(start), int(end)
+    if end <= start:
+        return []
+    ordered = sorted({start, end, *(max(start, min(end, int(value))) for value in frames)})
+    minimum = max(1, int(minimum))
+    filtered = [start]
+    for value in ordered[1:-1]:
+        if value - filtered[-1] >= minimum and end - value >= minimum:
+            filtered.append(value)
+    filtered.append(end)
+
+    if maximum_intervals and len(filtered) - 1 > maximum_intervals:
+        targets = [round(start + (end - start) * index / maximum_intervals) for index in range(1, maximum_intervals)]
+        pool = filtered[1:-1]
+        chosen: list[int] = []
+        for target in targets:
+            candidates = [value for value in pool if (not chosen or value > chosen[-1])]
+            if not candidates:
+                break
+            value = min(candidates, key=lambda item: (abs(item - target), item))
+            if value - (chosen[-1] if chosen else start) >= minimum and end - value >= minimum:
+                chosen.append(value)
+        filtered = [start, *chosen, end]
+    return list(zip(filtered, filtered[1:]))
+
+
+def _even_grid_intervals(segment: dict, count: int, minimum: int = 2) -> list[tuple[int, int]]:
+    """Choose evenly spaced boundaries, but only from the musical grid."""
+
+    start, end = int(segment["start_frame"]), int(segment["end_frame"])
+    candidates = sorted({start, end, *(int(value) for value in segment.get("cut_frames", []))})
+    count = max(1, min(int(count), max(1, len(candidates) - 1)))
+    chosen = [start]
+    for index in range(1, count):
+        target = round(start + (end - start) * index / count)
+        available = [
+            value for value in candidates
+            if value - chosen[-1] >= minimum and end - value >= minimum * (count - index)
+        ]
+        if not available:
+            break
+        chosen.append(min(available, key=lambda value: (abs(value - target), value)))
+    chosen.append(end)
+    return _frame_intervals(chosen, start, end, minimum=minimum)
+
+
+def _sidecar_alpha(source: Path) -> Path | None:
+    candidates = (
+        source.with_name(f"{source.stem}-alpha.png"),
+        source.with_name(f"alpha-{source.stem}.png"),
+        source.with_name(f"{source.stem}.alpha.png"),
+    )
+    return next((candidate for candidate in candidates if candidate.is_file()), None)
+
+
+def _layered_asset_pool(
+    images: Sequence[Path],
+    cutouts: Sequence[Path],
+    job_dir: Path,
+    maximum_sources: int = 4,
+) -> tuple[list[LayeredAssets], list[tuple[LayeredAssets, Path, str]]]:
+    """Prepare a compact, varied set of inpainted scene plates."""
+
+    if not images or not cutouts:
+        return [], []
+    primary = Path(images[0])
+    remaining = [Path(value) for value in images[1:] if Path(value).is_file()]
+
+    def optional_scene(value: Path) -> bool:
+        source_match = re.search(r"source-(\d+)", value.stem)
+        if source_match:
+            return int(source_match.group(1)) > 0
+        upload_match = re.fullmatch(r"media-(\d+)", value.stem)
+        return bool(upload_match and int(upload_match.group(1)) > 0)
+
+    registered = [value for value in remaining if _sidecar_alpha(value) is not None]
+    optional = [value for value in remaining if optional_scene(value)]
+    other = [value for value in remaining if value not in registered and value not in optional]
+    # One explicit extra scene is enough to honour a multi-upload without
+    # letting other animals replace the protagonist.  The remaining plates
+    # come from registered primary frames whose dog/person can be inpainted.
+    remaining = [*optional[:1], *registered, *optional[1:], *other]
+    scene_sources: list[Path] = []
+    for value in [primary, *remaining]:
+        try:
+            identity = value.resolve()
+        except OSError:
+            identity = value
+        if any(existing.resolve() == identity for existing in scene_sources):
+            continue
+        scene_sources.append(value)
+        if len(scene_sources) >= maximum_sources:
+            break
+
+    assets: list[LayeredAssets] = []
+    plates: list[tuple[LayeredAssets, Path, str]] = []
+    for index, scene in enumerate(scene_sources):
+        try:
+            prepared = prepare_layered_assets(
+                scene,
+                cutouts[0],
+                job_dir / "layer-cache",
+                seed=index * 97 + 17,
+                source_alpha=_sidecar_alpha(scene),
+            )
+        except (OSError, ValueError, cv2.error):
+            continue
+        assets.append(prepared)
+        for name in BACKGROUND_NAMES:
+            plates.append((prepared, Path(prepared.backgrounds[name]), name))
+    return assets, plates
+
+
+def _climax_intervals(edit_plan: dict) -> list[tuple[int, int]]:
+    """Use beats plus actual attacks; never a periodic visual fallback."""
+
+    cue = edit_plan["cues"]["climax"]
+    start, end = int(cue["start_frame"]), int(cue["end_frame"])
+    points = [
+        point for point in edit_plan.get("sync_grid", [])
+        if start <= int(point["frame"]) <= end
+    ]
+    mandatory = {start, end}
+    musical = {
+        int(point["frame"])
+        for point in points
+        if point.get("level") == "beat"
+        or (point.get("onset") and float(point.get("accent_strength", 0.0)) >= 0.24)
+    }
+    duration_seconds = (end - start) / FPS
+    target_intervals = max(4, min(60, round(duration_seconds * 3.65)))
+    selected = mandatory | musical
+    if len(selected) - 1 < target_intervals:
+        for level in ("half", "quarter"):
+            candidates = sorted({
+                int(point["frame"])
+                for point in points
+                if point.get("level") == level and int(point["frame"]) not in selected
+            })
+            required = min(
+                len(candidates),
+                target_intervals - (len(selected) - 1),
+            )
+            # Fill the entire climax, not the first N subdivisions.  Quantile
+            # targets make the added half/quarter beats spatially uniform even
+            # when every candidate has identical onset strength.
+            targets = [
+                start + (end - start) * (index + 1) / (required + 1)
+                for index in range(required)
+            ]
+            for target in targets:
+                available = [value for value in candidates if value not in selected]
+                if not available:
+                    break
+                value = min(
+                    available,
+                    key=lambda frame: (
+                        abs(frame - target),
+                        -min(abs(frame - chosen) for chosen in selected),
+                        frame,
+                    ),
+                )
+                selected.add(value)
+                if len(selected) - 1 >= target_intervals:
+                    break
+            if len(selected) - 1 >= target_intervals:
+                break
+    return _frame_intervals(
+        sorted(selected),
+        start,
+        end,
+        minimum=3,
+        maximum_intervals=min(60, max(target_intervals, 4)),
+    )
+
+
 def _render_reference_edit(
     paths: Sequence[Path], images: list[Path], video_times: list[tuple[Path, float]], cutouts: list[Path], audio: Path,
     job_dir: Path, destination: Path, duration: float, rhythm: dict, title: str, progress: Progress | None,
 ) -> dict:
-    onsets, strong, beat = _onsets(rhythm, duration), _strong_onsets(rhythm, duration), _beat(rhythm)
-    fallback_drop = duration * (11.47 / 24.23)
-    drop = _visual_drop_time(rhythm, duration, fallback_drop)
-    # Very early analyzer candidates cannot contain the measured intro,
-    # roulette and five-word cue sheet. Keep short edits frame-safe instead
-    # of over-allocating those sections and truncating the final climax.
-    minimum_drop = duration * (0.50 if duration < 8 else 0.40)
-    drop = round(max(minimum_drop, min(duration - 0.8, drop)) * FPS) / FPS
-    cues = _reference_cues(drop, beat, duration)
-    drop = float(cues["drop"])
-    intro_end = float(cues["intro_end"])
-    roulette_end = float(cues["roulette_end"])
-    phrase_start = float(cues["phrase_start"])
-    timeline = _Timeline(job_dir, audio, destination, duration, progress)
+    edit_plan = build_edit_timeline(rhythm, duration, FPS)
+    window = edit_plan["window"]
+    cues = edit_plan["cues"]
+    duration = float(window["duration"])
+    timeline = _Timeline(
+        job_dir,
+        audio,
+        destination,
+        duration,
+        progress,
+        audio_start=float(window["start"]),
+    )
     labels = _intro_labels(title)
-    intro_sources = _intro_asset_groups(paths, images, cutouts)
+    scheduled_frames: list[int] = []
 
-    # Act 1: each subject gets raw context followed by a cutout pose.
-    _notify(progress, "intro", 8)
-    intro_slots = int(cues["intro_slots"])
-    slot_weights = [29, 23, 23, 22][:intro_slots]
-    slot_durations = _weighted_frame_durations(0, intro_end, slot_weights, minimum=8)
-    for index, slot_duration in enumerate(slot_durations):
-        slot_frames = max(4, round(slot_duration * FPS))
-        raw_frames = max(2, min(slot_frames - 2, round(slot_frames * 0.55)))
-        raw_duration, cut_duration = raw_frames / FPS, (slot_frames - raw_frames) / FPS
-        source_index, source_assets = intro_sources[index % len(intro_sources)]
-        variant_index = (index // len(intro_sources)) % len(source_assets)
-        source_image, _ = source_assets[variant_index]
-        label = labels[source_index % len(labels)]
-        original_source = Path(paths[source_index])
-        slot_video_times = [value for value in video_times if value[0] == original_source]
-        if original_source.suffix.lower() in VIDEO_EXTENSIONS and slot_video_times:
-            source_video, source_time = slot_video_times[(index // max(1, len(paths))) % len(slot_video_times)]
-            overlay = _intro_text_overlay(label, job_dir / f"reference-intro-text-{index:02d}.png")
-            timeline.add_intro_video(source_video, overlay, source_time, raw_duration)
+    # Act 1: the same protagonist alternates between its real context and a
+    # clean isolated pose.  All eight boundaries come from the sync grid.
+    _notify(progress, "intro sincronizzata", 8)
+    intro = cues["intro"]
+    intro_span = int(intro["end_frame"]) - int(intro["start_frame"])
+    intro_piece_count = 8 if intro_span >= 48 else 4
+    intro_intervals = _even_grid_intervals(intro, intro_piece_count, minimum=2)
+    primary = Path(paths[0])
+    primary_video_times = [value for value in video_times if Path(value[0]) == primary]
+    primary_samples = images[: max(1, min(len(images), len(cutouts)))]
+    for index, (left, right) in enumerate(intro_intervals):
+        scheduled_frames.append(left)
+        card_index = index // 2
+        clip_duration = (right - left) / FPS
+        label = labels[card_index % len(labels)]
+        if index % 2 == 0:
+            if primary.suffix.lower() in VIDEO_EXTENSIONS and primary_video_times:
+                source, source_time = primary_video_times[card_index % len(primary_video_times)]
+                overlay = _intro_text_overlay(label, job_dir / f"reference-intro-text-{card_index:02d}.png")
+                timeline.add_intro_video(source, overlay, source_time, clip_duration)
+            else:
+                source = primary_samples[card_index % len(primary_samples)]
+                board = _raw_board(source, label, job_dir / f"reference-intro-raw-{card_index:02d}.jpg", darken=0.04)
+                timeline.add_still(board, clip_duration, "intro-in", accent=False)
         else:
-            board = _raw_board(
-                source_image,
-                label,
-                job_dir / f"reference-intro-raw-{index:02d}.jpg",
-                darken=0.04,
-            )
-            timeline.add_still(board, raw_duration, "intro-in", accent=False)
+            subject = cutouts[card_index % len(cutouts)]
+            board = _cutout_board(subject, job_dir / f"reference-intro-cut-{card_index:02d}.png", card_index)
+            timeline.add_still(board, clip_duration, "roulette", accent=False)
 
-        # The reference fires several 3-frame poses after every raw card.
-        pose_count = max(1, min(4, round((slot_frames - raw_frames) / 3)))
-        pose_durations = _weighted_frame_durations(0, cut_duration, [1] * pose_count, minimum=2)
-        for pose_index, pose_duration in enumerate(pose_durations):
-            cutout_path = source_assets[(variant_index + pose_index) % len(source_assets)][1]
-            board = _cutout_board(
-                cutout_path,
-                job_dir / f"reference-intro-cut-{index:02d}-{pose_index:02d}.png",
-                index * 3 + pose_index,
-            )
-            timeline.add_still(
-                board,
-                pose_duration,
-                "roulette",
-                accent=False,
-            )
+    # Act 2: one settling entrance followed by quarter-beat hard cuts.  Unlike
+    # the former implementation this has no arbitrary 48-scene limiter.
+    _notify(progress, "roulette sul beat", 26)
+    roulette = cues["roulette"]
+    roulette_start, roulette_end = int(roulette["start_frame"]), int(roulette["end_frame"])
+    roulette_grid = sorted({roulette_start, roulette_end, *(int(value) for value in roulette.get("cut_frames", []))})
+    entry_target = roulette_start + 11
+    entry_candidates = [value for value in roulette_grid if roulette_start + 2 <= value <= roulette_end - 2]
+    entry_end = min(entry_candidates, key=lambda value: abs(value - entry_target)) if entry_candidates else min(roulette_end, roulette_start + 2)
+    if entry_end > roulette_start:
+        scheduled_frames.append(roulette_start)
+        board = _cutout_board(cutouts[0], job_dir / "reference-roulette-entry.png", 0)
+        timeline.add_still(board, (entry_end - roulette_start) / FPS, "roulette-entry", accent=False)
+    roulette_intervals = _frame_intervals(
+        [value for value in roulette_grid if value >= entry_end],
+        entry_end,
+        roulette_end,
+        minimum=2,
+        maximum_intervals=72,
+    )
+    for index, (left, right) in enumerate(roulette_intervals):
+        scheduled_frames.append(left)
+        board = _cutout_board(
+            cutouts[index % len(cutouts)],
+            job_dir / f"reference-roulette-{index:03d}.png",
+            index + 1,
+        )
+        timeline.add_still(board, (right - left) / FPS, "roulette", accent=False)
 
-    # Act 2: the measured reference cadence is mostly three frames per pose,
-    # with a hard cap of 48 poses for a 24-second edit.
-    _notify(progress, "roulette", 28)
-    roulette_span_frames = round((roulette_end - intro_end) * FPS)
-    entry_frames = min(max(2, roulette_span_frames - 2), max(2, round((44 / 45) * beat * FPS)))
-    entry_duration = entry_frames / FPS
-    entry_board = _cutout_board(cutouts[0], job_dir / "reference-roulette-entry.png", 0)
-    timeline.add_still(entry_board, entry_duration, "roulette-entry", accent=False)
-    roulette_micro_start = intro_end + entry_duration
-    roulette_durations = _dense_durations(roulette_micro_start, roulette_end, 3.06, maximum=48)
-    for index, clip_duration in enumerate(roulette_durations):
-        board = _cutout_board(cutouts[(index * 7 + index // max(1, len(cutouts))) % len(cutouts)], job_dir / f"reference-roulette-{index:02d}.png", index + 1)
-        timeline.add_still(board, clip_duration, "roulette", accent=False)
-
-    # Act 3: subjects first accumulate around an empty centre, then the five
-    # words use the measured unequal holds from the reference.
-    _notify(progress, "collage", 48)
-    build_count = max(2, min(4, round((phrase_start - roulette_end) / max(0.14, beat * 0.62))))
-    build_durations = _weighted_frame_durations(roulette_end, phrase_start, [1] * build_count, minimum=4)
-    for index, clip_duration in enumerate(build_durations):
+    # Act 3: a short additive build, then the exact five word cues.  Text is
+    # drawn below the cutout layer so the subject and typography share depth.
+    _notify(progress, "collage e testo", 46)
+    build = cues["build"]
+    build_intervals = _even_grid_intervals(build, 3, minimum=2)
+    for index, (left, right) in enumerate(build_intervals):
+        scheduled_frames.append(left)
         board = _collage_board(
             cutouts,
             job_dir / f"reference-collage-build-{index:02d}.png",
             "",
-            index + 2,
+            min(4, index + 2),
             0,
         )
-        timeline.add_still(board, clip_duration, "collage", accent=False)
-
-    words = ["CAN", "YOU", "IMAGINE", "FLOATING", "WEIGHTLESS"]
-    collage_durations = _weighted_frame_durations(phrase_start, drop, [7, 7, 22, 13, 19], minimum=3)
-    for index, clip_duration in enumerate(collage_durations):
-        board = _collage_board(cutouts, job_dir / f"reference-collage-{index:02d}.png", words[index], 4, 0)
-        timeline.add_still(board, clip_duration, "collage", accent=False)
-
-    # Act 4: alternate beat and half-beat source clips. Scored moments avoid
-    # dead/off-focus footage; accents are short and sparse.
-    _notify(progress, "climax", 62)
-    remaining = duration - drop
-    climax_pattern = [6, 6, 5, 6, 11, 12, 7, 4, 6, 5, 11, 17, 10, 7, 11, 12, 23, 5, 7, 4, 6, 16, 4, 13, 11, 6, 12, 5, 11, 17, 11, 6, 11, 12, 11, 6, 5, 11, 15, 6, 13]
-    impact_frames = [6, 6, 5, 6]
-    available_frames = max(0, round(remaining * FPS))
-    while impact_frames and sum(impact_frames) > max(0, available_frames - 4):
-        impact_frames.pop()
-    impact_durations = [frames / FPS for frames in impact_frames]
-    raw_start = drop + sum(impact_durations)
-    raw_remaining = max(0.0, duration - raw_start)
-    raw_target_count = max(1, min(60, round(raw_remaining / max(4 / FPS, beat * 0.865)))) if raw_remaining >= 4 / FPS else 0
-    raw_weights = [climax_pattern[(index + 4) % len(climax_pattern)] for index in range(raw_target_count)]
-    raw_durations = (
-        _onset_aligned_weighted_durations(raw_start, duration, raw_weights, onsets, minimum=4, radius_frames=2)
-        if raw_weights else []
-    )
-    for index, clip_duration in enumerate(impact_durations):
+        timeline.add_still(board, (right - left) / FPS, "collage", accent=False)
+    for index, word in enumerate(cues["words"]):
+        left, right = int(word["start_frame"]), int(word["end_frame"])
+        scheduled_frames.append(left)
         board = _collage_board(
             cutouts,
-            job_dir / f"reference-drop-impact-{index:02d}.png",
-            "",
-            min(6, 4 + index),
-            index,
+            job_dir / f"reference-collage-{index:02d}.png",
+            str(word["text"]),
+            4,
+            0,
         )
+        timeline.add_still(board, (right - left) / FPS, "collage", accent=False)
+
+    # Prepare inpainted scene plates once.  The same clean master sprite is
+    # then animated over every plate through independent FFmpeg layers.
+    _notify(progress, "scene 2.5D", 58)
+    layered_assets, plate_pool = _layered_asset_pool(images, cutouts, job_dir)
+
+    impact_points = sorted({int(point["frame"]) for point in cues["impacts"]})
+    impact_intervals = list(zip(impact_points, impact_points[1:]))
+    for index, (left, right) in enumerate(impact_intervals):
+        scheduled_frames.append(left)
+        if plate_pool:
+            assets, _plate, background_name = plate_pool[(index * 5) % len(plate_pool)]
+            board = render_layered_board(
+                assets,
+                job_dir / f"reference-drop-impact-{index:02d}.png",
+                shot_index=index,
+                progress=min(1.0, 0.16 + index * 0.21),
+                accent=1.0,
+                background=background_name,
+            )
+        else:
+            board = _collage_board(
+                cutouts,
+                job_dir / f"reference-drop-impact-{index:02d}.png",
+                "",
+                min(6, 4 + index),
+                index,
+            )
         timeline.add_still(
             board,
-            clip_duration,
-            "impact-" + ("push", "whip-left", "whip-right", "pull")[index],
+            (right - left) / FPS,
+            "impact-" + ("push", "whip-left", "whip-right", "pull")[index % 4],
             accent=True,
         )
-    if video_times:
-        for index, clip_duration in enumerate(raw_durations):
-            source, source_time = video_times[index % len(video_times)]
-            modes = (
-                "punch", "close-left", "speed", "whip", "close-right", "beat",
-                "hflip", "close-high", "pull", "detail", "close-low", "beat",
-            )
-            mode = modes[index % len(modes)]
-            cut_time = raw_start + sum(raw_durations[:index])
-            # Let detected musical attacks lead the climax.  A sparse
-            # periodic fallback covers weak analyses without flashing on
-            # three out of every four shots and creating off-beat events.
-            accent = _is_accent(cut_time, strong) or index % 3 == 0
-            timeline.add_video(source, max(0, source_time - clip_duration * 0.20), clip_duration, mode, accent=accent)
-            _notify(progress, "climax", 62 + round(28 * (index + 1) / max(1, len(raw_durations))))
+
+    # Act 4: never return to the raw slideshow.  A persistent central subject
+    # remains a foreground layer while plates, parallax and 3D entrance motion
+    # change on beat/onset boundaries only.
+    _notify(progress, "climax 2.5D", 64)
+    climax_intervals = _climax_intervals(edit_plan)
+    grid_by_frame = {int(point["frame"]): point for point in edit_plan["sync_grid"]}
+    if plate_pool:
+        step = max(1, len(plate_pool) // 2 + 1)
+        while math.gcd(step, len(plate_pool)) != 1:
+            step += 1
     else:
-        for index, clip_duration in enumerate(raw_durations):
-            cut_time = raw_start + sum(raw_durations[:index])
-            photo_modes = ("push", "whip-left", "pull", "whip-right", "pulse")
-            accent = _is_accent(cut_time, strong) or index % 3 == 0
-            timeline.add_still(images[index % len(images)], clip_duration, photo_modes[index % len(photo_modes)], accent=accent)
+        step = 1
+    modes = ("depth", "whip", "depth", "tunnel", "depth", "whip")
+    for index, (left, right) in enumerate(climax_intervals):
+        scheduled_frames.append(left)
+        point = grid_by_frame.get(left, {})
+        strength = float(point.get("accent_strength", 0.0)) if point.get("onset") else 0.0
+        accent = strength if strength >= 0.32 else 0.0
+        clip_duration = (right - left) / FPS
+        if plate_pool and layered_assets:
+            assets, plate, _name = plate_pool[(index * step) % len(plate_pool)]
+            mode = "whip" if accent >= 0.72 else modes[index % len(modes)]
+            timeline.add_layered(assets, plate, clip_duration, mode, accent)
+        else:
+            board = _cutout_board(
+                cutouts[index % len(cutouts)],
+                job_dir / f"reference-climax-fallback-{index:03d}.png",
+                index,
+            )
+            timeline.add_still(board, clip_duration, "whip-left" if index % 2 else "push", accent=accent >= 0.32)
+        _notify(progress, "climax 2.5D", 64 + round(27 * (index + 1) / max(1, len(climax_intervals))))
+
     timeline.finish()
-    return {"scenes": len(timeline.clips), "drop_time": drop, "mode": "reference_edit"}
+    scheduled_frames.append(int(window["duration_frames"]))
+    return {
+        "scenes": len(timeline.clips),
+        "drop_time": float(window["visual_drop"]),
+        "source_drop_time": float(window["source_visual_drop"]),
+        "duration": duration,
+        "audio_start": float(window["start"]),
+        "audio_end": float(window["end"]),
+        "timeline_version": edit_plan["version"],
+        "scheduled_frames": sorted(set(scheduled_frames)),
+        "mode": "reference_edit",
+    }
 
 
 def _silhouette_board(subject_path: Path, destination: Path, progress_value: float, questions: int = 0, reveal: float = 0.0) -> Path:

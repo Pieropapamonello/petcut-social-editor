@@ -253,6 +253,23 @@ label small {
   font-size: 0.78rem;
 }
 
+.optional-media {
+  margin-top: 20px;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+}
+
+.optional-media > p {
+  margin: 0 0 10px;
+  color: #e2e3e5;
+  font-size: 0.82rem;
+}
+
+.optional-media > p span {
+  color: var(--muted);
+  font-weight: 450;
+}
+
 .analysis-panel {
   margin-top: 18px;
   padding: 15px;

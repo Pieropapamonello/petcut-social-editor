@@ -6,6 +6,7 @@ from unittest.mock import patch
 import inspect
 
 from render_engine import (
+    _climax_intervals,
     _drop_time,
     _durations,
     _finish,
@@ -105,21 +106,63 @@ class RenderTimelineTests(unittest.TestCase):
         self.assertEqual(groups[0][1][1], (images[1], cutouts[1]))
         self.assertEqual(groups[1][1][0], (images[2], cutouts[2]))
 
-    def test_finish_normalises_reference_colour_metadata(self):
+    def test_finish_normalises_reference_colour_metadata_and_trims_audio(self):
         with tempfile.TemporaryDirectory() as directory, patch("render_engine._run") as run:
             root = Path(directory)
             clip = root / "clip.mp4"
-            _finish([clip], root / "audio.wav", root / "out.mp4", 1.0, root)
+            _finish([clip], root / "audio.wav", root / "out.mp4", 1.0, root, audio_start=4.2)
             command = [str(value) for value in run.call_args.args[0]]
             self.assertIn("libx264", command)
             self.assertIn("yuv420p", command)
             self.assertIn("tv", command)
             self.assertGreaterEqual(command.count("bt709"), 3)
+            self.assertTrue(any("atrim=start=4.200000:duration=1.000000" in value for value in command))
 
-    def test_climax_periodic_accents_are_sparse(self):
+    def test_climax_has_no_periodic_flash_fallback(self):
         source = inspect.getsource(__import__("render_engine")._render_reference_edit)
-        self.assertEqual(source.count("index % 3 == 0"), 2)
+        self.assertNotIn("index % 3", source)
         self.assertNotIn("index % 4 != 3", source)
+        self.assertIn('point.get("onset")', source)
+
+    def test_climax_boundaries_are_selected_only_from_sync_grid(self):
+        grid = [
+            {"frame": frame, "level": "beat" if frame % 12 == 0 else "half", "onset": frame % 9 == 0, "accent_strength": 0.8}
+            for frame in range(60, 181, 6)
+        ]
+        plan = {
+            "sync_grid": grid,
+            "cues": {"climax": {"start_frame": 60, "end_frame": 180}},
+        }
+        intervals = _climax_intervals(plan)
+        boundaries = {value for interval in intervals for value in interval}
+        self.assertTrue(boundaries.issubset({point["frame"] for point in grid}))
+        self.assertEqual(min(boundaries), 60)
+        self.assertEqual(max(boundaries), 180)
+
+    def test_extra_climax_subdivisions_are_spread_across_the_whole_act(self):
+        grid = [
+            {
+                "frame": frame,
+                "level": "beat" if frame % 10 == 0 else "half",
+                "onset": False,
+                "accent_strength": 0.0,
+            }
+            for frame in range(0, 301, 5)
+        ]
+        plan = {
+            "sync_grid": grid,
+            "cues": {"climax": {"start_frame": 0, "end_frame": 300}},
+        }
+        intervals = _climax_intervals(plan)
+        boundaries = {value for interval in intervals for value in interval}
+        selected_halves = sorted(value for value in boundaries if value % 10 == 5)
+        self.assertGreaterEqual(len(selected_halves), 4)
+        quartiles = [
+            sum(lower <= value < upper for value in selected_halves)
+            for lower, upper in ((0, 75), (75, 150), (150, 225), (225, 301))
+        ]
+        self.assertTrue(all(count >= 1 for count in quartiles), quartiles)
+        self.assertLessEqual(max(quartiles) - min(quartiles), 1, quartiles)
 
 
 if __name__ == "__main__":

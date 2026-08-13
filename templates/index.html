@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Crea un video verticale sincronizzato con la musica usando foto e clip.">
   <title>PetCut Studio</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='5') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='6') }}">
 </head>
 <body>
   <header class="site-header">
@@ -20,7 +20,7 @@
     <section class="hero" aria-labelledby="page-title">
       <p class="eyebrow">MONTAGGI SOCIAL AUTOMATICI</p>
       <h1 id="page-title">Carica. Ascolta.<br><span>Guarda.</span></h1>
-      <p>Aggiungi foto o video e una canzone. PetCut crea un edit verticale con tagli, scritte e transizioni a tempo.</p>
+      <p>Scegli il protagonista e una canzone. PetCut lo mantiene al centro mentre cambia scene, profondità ed effetti su ogni attacco musicale.</p>
     </section>
 
     <form id="editor-form" class="editor-card" enctype="multipart/form-data">
@@ -28,23 +28,39 @@
         <div class="section-heading">
           <span class="step-number" aria-hidden="true">1</span>
           <div>
-            <h2 id="media-heading">Foto o video</h2>
-            <p>Uno o più file. Funziona anche con un solo contenuto.</p>
+            <h2 id="media-heading">Soggetto principale</h2>
+            <p>Il cane, gatto o persona che deve restare protagonista.</p>
           </div>
         </div>
 
-        <label class="file-picker" for="media-input">
+        <label class="file-picker" for="primary-input">
           <span class="file-icon" aria-hidden="true">＋</span>
           <span class="file-picker-copy">
-            <strong>Scegli i file</strong>
+            <strong>Scegli il protagonista</strong>
             <small>JPG, PNG, WebP, MP4, MOV o WebM</small>
           </span>
           <span class="file-action" aria-hidden="true">Sfoglia</span>
         </label>
-        <input class="visually-hidden" id="media-input" type="file" name="media"
+        <input class="visually-hidden" id="primary-input" type="file" name="primary"
           accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/webm"
-          multiple required aria-describedby="media-summary upload-limit">
-        <div id="media-summary" class="file-summary" aria-live="polite">Nessun contenuto selezionato.</div>
+          required aria-describedby="primary-summary upload-limit">
+        <div id="primary-summary" class="file-summary" aria-live="polite">Nessun protagonista selezionato.</div>
+
+        <div class="optional-media">
+          <p><strong>Scene e sfondi</strong> <span>(facoltativi)</span></p>
+          <label class="file-picker compact" for="media-input">
+            <span class="file-icon" aria-hidden="true">＋</span>
+            <span class="file-picker-copy">
+              <strong>Aggiungi altri file</strong>
+              <small>Diventeranno ambienti, texture e cambi di scena</small>
+            </span>
+            <span class="file-action" aria-hidden="true">Sfoglia</span>
+          </label>
+          <input class="visually-hidden" id="media-input" type="file" name="media"
+            accept="image/jpeg,image/png,image/webp,video/mp4,video/quicktime,video/webm"
+            multiple aria-describedby="media-summary upload-limit">
+          <div id="media-summary" class="file-summary" aria-live="polite">Nessuna scena aggiuntiva.</div>
+        </div>
       </section>
 
       <section class="form-section" aria-labelledby="audio-heading">
@@ -52,7 +68,7 @@
           <span class="step-number" aria-hidden="true">2</span>
           <div>
             <h2 id="audio-heading">Canzone</h2>
-            <p>Analizziamo automaticamente ritmo e drop.</p>
+            <p>Scegliamo automaticamente la sezione con il drop migliore.</p>
           </div>
         </div>
 
@@ -101,14 +117,14 @@
           <span class="step-number" aria-hidden="true">3</span>
           <div>
             <h2 id="preset-heading">Il montaggio</h2>
-            <p>La struttura è già definita e segue il video di riferimento.</p>
+            <p>Un solo protagonista, livelli separati e ogni cambio sulla musica.</p>
           </div>
         </div>
         <ol class="single-edit-flow" aria-label="Fasi del montaggio">
-          <li><strong>1</strong><span><b>Intro</b><small>Clip in movimento con nomi grandi</small></span></li>
-          <li><strong>2</strong><span><b>Roulette</b><small>Pose scontornate e cambi rapidi sul nero</small></span></li>
-          <li><strong>3</strong><span><b>Frase</b><small>Parole cinetiche al centro del collage</small></span></li>
-          <li><strong>4</strong><span><b>Climax</b><small>Hard cut, flash e zoom blur sul drop</small></span></li>
+          <li><strong>1</strong><span><b>Intro</b><small>Il protagonista entra sul primo attacco</small></span></li>
+          <li><strong>2</strong><span><b>Build</b><small>Pose e ambienti cambiano su beat e onset</small></span></li>
+          <li><strong>3</strong><span><b>Frase</b><small>Testo cinetico senza coprire il soggetto</small></span></li>
+          <li><strong>4</strong><span><b>Climax 2.5D</b><small>Parallax, profondità, whip e scie sul drop</small></span></li>
         </ol>
       </section>
 
@@ -130,7 +146,7 @@
               <option value="24" selected>24 secondi · come il riferimento</option>
               <option value="30">30 secondi</option>
             </select>
-            <small class="field-help">Per la struttura completa usa una canzone di almeno 24 secondi.</small>
+            <small class="field-help">È la durata massima: PetCut può scegliere un estratto più corto per posizionare bene il drop.</small>
           </label>
 
           <label for="title-input">
@@ -191,6 +207,6 @@
     <span>Output verticale · MP4 · 30 fps</span>
   </footer>
 
-  <script src="{{ url_for('static', filename='app.js', v='5') }}"></script>
+  <script src="{{ url_for('static', filename='app.js', v='6') }}"></script>
 </body>
 </html>
